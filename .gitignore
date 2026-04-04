@@ -1,0 +1,102 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ──────────────────────────────────────────────
+# Personal Information (NEVER commit these)
+# ──────────────────────────────────────────────
+*.pdf
+Профил_на_English.pdf
+*.resume
+*.cv
+
+# ──────────────────────────────────────────────
+# Scraped Data & Outputs (NEVER commit these)
+# ──────────────────────────────────────────────
+linkedin_leads.csv
+Jobs.bg-leads.csv
+*.csv
+*.log
+*.xlsx
+*.xls
+scraper.log
+successful-scrapes/
+
+# ──────────────────────────────────────────────
+# Persistent Browser Session (contains cookies)
+# ──────────────────────────────────────────────
+.browser_session/
+
+# ──────────────────────────────────────────────
+# Secrets, API Keys & Local Config
+# ──────────────────────────────────────────────
+config.py
+.env
+.env.local
+.env.*.local
+secrets/
+keys/
+*.key
+*.pem
+*.crt
+Windows-key-open-router.md
+
+# ──────────────────────────────────────────────
+# Debug / Temp Files
+# ──────────────────────────────────────────────
+debug_*.py
+debug_*.png
+debug_*.html
+test_jobsbg.py
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Test outputs
+test_output/
+coverage.xml
+.coverage
+.pytest_cache/
+.mypy_cache/

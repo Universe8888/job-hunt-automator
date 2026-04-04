@@ -1,0 +1,262 @@
+# 🔍 LinkedIn & Jobs.bg Scraper v3.0
+
+A local Python-based job scraper built with **Playwright** and **playwright-stealth**. Supports **LinkedIn** and **Jobs.bg** as dual scraping targets, matches jobs against your professional profile using AI-powered skill matching, and exports leads to CSV.
+
+## Features
+
+### Core Engine
+- 🔍 **Multi-Site Scraping** — Toggle between LinkedIn and Jobs.bg with `--site`
+- 🕵️ **Stealth Mode** — `playwright-stealth`, realistic User-Agent rotation, randomised viewports, human-like delays
+- 🛡️ **Anti-Blocking** — Auto-dismisses modals, handles rate limits with backoff
+- 🧠 **Persistent Sessions** — Solve a captcha once; cookies are saved locally for future runs
+- 🛑 **Graceful Shutdown** — Close the browser window to stop the program instantly
+
+### LinkedIn-Specific
+- 🔗 **Dual Strategy** — Guest API (fast) with full-browser fallback
+- 🔗 **URL Validation** — Only processes valid `/jobs/view/` URLs; filters out company pages
+- 🧹 **Content Sanitisation** — Detects and discards sign-in modal garbage in descriptions
+
+### Jobs.bg-Specific
+- 🇧🇬 **Location Mapping** — Bulgarian city IDs (Plovdiv = `2`) mapped in config
+- 🔄 **Captcha Detection** — Auto-detects Cloudflare/slider challenges, pauses and waits for manual solve
+- 🖼️ **Iframe Extraction** — Grabs job descriptions embedded in HTML iframes
+
+### Matching & Export
+- 🎯 **AI Profile Matching** — Scores jobs against your PDF resume (ISO 27001, SQL, Tableau, RAG/AI…)
+- 📊 **Rich CSV Export** — Deduped, UTF-8 BOM (Excel-friendly), includes matched skills & salary info
+- 📂 **Separate Output Files** — `linkedin_leads.csv` for LinkedIn, `Jobs.bg-leads.csv` for Jobs.bg
+- 📈 **Progress Bars** — Live tracking during description fetching (via tqdm)
+- 📅 **Date Filters** — Only see jobs from the past day, week, or month
+
+## Quick Start
+
+### 1. Python Environment Setup
+
+```bash
+# Create virtual environment
+python -m venv .venv
+
+# Activate on Windows:
+.venv\Scripts\activate
+
+# Activate on macOS/Linux:
+source .venv/bin/activate
+```
+
+### 2. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+### 3. Validate Installation
+
+```bash
+python validate_dependencies.py
+```
+
+### 4. (Optional) Add Your Profile PDF
+
+Place your resume/CV as `my_resume.pdf` in the project root. The scraper will automatically extract skills for matching.
+
+You can also use a different filename: `--profile custom_resume.pdf`
+
+### 5. Run the Scraper
+
+```bash
+# ─── LinkedIn (default) ───────────────────────
+python main.py                                    # Default search
+python main.py --quick                            # Skip description fetching
+python main.py --headless                         # Run without visible browser
+python main.py --days 7 --max-jobs 50             # Past week, limit 50
+
+# ─── Jobs.bg ──────────────────────────────────
+python main.py --site jobs.bg                     # Scrape Jobs.bg (headed, recommended)
+python main.py --site jobs.bg --max-jobs 100      # Limit to 100 jobs
+python main.py --site jobs.bg --headless          # Headless (needs solved captcha first)
+
+# ─── Common Options ───────────────────────────
+python main.py --profile my_resume.pdf            # Custom PDF profile
+python main.py --keywords "Data Analyst" "DevOps" # Override keywords
+python main.py --verbose                          # Debug logging
+```
+
+> **💡 First time using Jobs.bg?** Run without `--headless` so the browser opens. If a slider captcha appears, solve it manually once. Future runs (even headless) will reuse the saved session.
+
+### 6. Review Results
+
+Open the output CSV in Excel or any spreadsheet app:
+
+| Site | Output File |
+|------|-------------|
+| LinkedIn | `linkedin_leads.csv` |
+| Jobs.bg | `Jobs.bg-leads.csv` |
+
+#### CSV Columns
+
+| Column | Description |
+|--------|-------------|
+| Job Title | Position name |
+| Company Name | Hiring company |
+| Location | City/country or Remote |
+| Posting Date | When the job was posted |
+| Salary Info | Salary range (when available) |
+| Description | Full job description (up to 5000 chars) |
+| Job URL | Direct link to the listing |
+| Search Keyword | Which keyword matched this job |
+| Search Location | Which location search found it |
+| Match Score | 0–100% match against your profile |
+| Matched Skills | Skills from your profile found in the description |
+| Match Flag | ✅ Good Match or — |
+
+## CLI Reference
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--site {linkedin,jobs.bg}` | Select target site | `linkedin` |
+| `--profile FILE` | Path to PDF resume for matching | `my_resume.pdf` |
+| `--quick` | Skip description fetching (faster) | Off |
+| `--keywords K1 K2…` | Override search keywords | From config |
+| `--headless` | Run browser without GUI | Off |
+| `--days N` | Only jobs from past N days (1, 7, 30) | All time |
+| `--max-jobs N` | Stop after N jobs | Unlimited |
+| `--verbose` | Debug logging | Off |
+
+## Configuration
+
+Copy `config.example.py` to `config.py` and edit it to customise:
+
+- **Target Site** — Default scraping target (`linkedin` or `jobs.bg`)
+- **Keywords** — Job titles to search for
+- **Locations** — LinkedIn geoIds + Jobs.bg location IDs
+- **Work Types** — Remote (2), Hybrid (3), On-site (1)
+- **Date Filter** — Default date range for job postings
+- **Experience Levels** — Internship, Entry, Associate, Mid-Senior, Director, Executive
+- **Skill Weights** — Primary (1.0), Domain (0.8), Tools (0.5)
+- **Delays** — Min/max seconds between requests
+- **Match Threshold** — Minimum score to flag as "Good Match"
+- **Session Directory** — Where persistent browser cookies are stored
+
+### Environment Variables
+
+Create a `.env` file from the template:
+
+```bash
+cp .env.example .env
+```
+
+Supported variables:
+- `TARGET_SITE` — Default site (`linkedin` or `jobs.bg`)
+- `PROXY_URL` — HTTP proxy for rate limiting (e.g., `http://user:pass@proxy:8080`)
+- `MAX_JOBS_PER_RUN` — Limit total jobs scraped (overridden by `--max-jobs`)
+- `HEADLESS` — Set to `true` to default to headless mode
+
+## Project Structure
+
+```
+├── main.py                  # Entry point with CLI & orchestrator
+├── config.example.py        # Template for search parameters & skill weights (copy to config.py)
+├── scraper.py               # LinkedIn scraping engine (API + browser)
+├── jobsbg_scraper.py        # Jobs.bg scraping engine
+├── stealth_config.py        # Browser stealth & proxy configuration
+├── csv_export.py            # CSV writer with deduplication
+├── profile_matcher.py       # Profile matching with load_skills()
+├── requirements.txt         # Python dependencies
+├── README.md                # This file
+├── .gitignore               # Git ignore rules
+├── .env.example             # Environment variables template
+├── validate_dependencies.py # Dependency validation script
+├── test_imports.py          # Basic import test
+├── linkedin_leads.csv       # LinkedIn output (generated, git-ignored)
+├── Jobs.bg-leads.csv        # Jobs.bg output (generated, git-ignored)
+├── .browser_session/        # Persistent cookies (generated, git-ignored)
+└── scraper.log              # Runtime log (generated, git-ignored)
+```
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Rate limited (429) | Increase `MIN_DELAY` / `MAX_DELAY` in config.py, or use `PROXY_URL` |
+| Sign-in modal won't dismiss | The scraper retries 3 times, then skips |
+| No results for a keyword | Try broader terms, different location, or remove `--days` filter |
+| CSV encoding issues | File uses UTF-8 with BOM — open with Excel or set encoding manually |
+| Selectors broken (LinkedIn) | LinkedIn changes HTML frequently — update selectors in `scraper.py` |
+| Selectors broken (Jobs.bg) | Update selectors in `jobsbg_scraper.py` (`.mdc-card`, `.job-view-left-column`) |
+| Browser closed → program hangs | v3.0 detects window close and exits cleanly |
+| Description is empty | URL was filtered or modal text was discarded; iframes are now extracted |
+| Jobs.bg captcha blocks | Run without `--headless`, solve captcha once, then use headless |
+| Jobs.bg still blocked after captcha | Delete `.browser_session/` folder and solve captcha again |
+
+### Rate Limiting (429 Errors)
+
+If you get rate-limited:
+1. Increase `MIN_DELAY` and `MAX_DELAY` in `config.py`
+2. Reduce `MAX_PAGES_PER_SEARCH`
+3. Use a proxy (configure `PROXY_URL` in `.env`)
+4. Wait 24 hours before trying again
+
+### Playwright Browser Issues
+
+```bash
+# Reinstall browsers
+playwright install chromium
+playwright install --force chromium
+
+# Check installation
+python -c "import playwright; print(playwright.__version__)"
+```
+
+### Profile Matching Not Working
+
+If jobs show 0% match score:
+1. Ensure your PDF is in the project root
+2. Check PDF is readable (not scanned image)
+3. Verify skill weights in `config.py` match your resume keywords
+4. Try with `--profile your_resume.pdf` flag
+
+## Changelog
+
+### v3.0 (2026-04-03)
+- **Added**: Jobs.bg scraping engine with `--site jobs.bg` flag
+- **Added**: Persistent browser sessions (`.browser_session/`) — solve captcha once
+- **Added**: Captcha auto-detection with 60-second manual solve window
+- **Added**: Iframe extraction for Jobs.bg embedded job descriptions
+- **Added**: Separate output files — `Jobs.bg-leads.csv` for Jobs.bg scrapes
+- **Added**: Graceful shutdown — closing the browser stops the program
+- **Added**: Randomised viewport sizes for better stealth fingerprinting
+- **Fixed**: Job titles corrupted by material "star" icons on Jobs.bg
+- **Fixed**: CSV column displacement from icon text injection
+- **Fixed**: Final "Done!" message now shows correct output filename
+- **Improved**: Browser recovery — full persistent context restart on crash
+
+### v2.0 (2026-04-03)
+- **Fixed**: PDF was re-read on every single job — now loaded once at startup
+- **Fixed**: Company page URLs (`/company/`) were being scraped as job listings
+- **Fixed**: Browser context crash cascade — auto-recovery with `BrowserSession`
+- **Fixed**: Sign-in modal text polluting job descriptions — content sanitisation
+- **Fixed**: Pagination mismatch with dynamic empty-page detection
+- **Added**: `--headless` flag for server/CI usage
+- **Added**: `--days` flag to filter by posting date (1, 7, 30 days)
+- **Added**: `--max-jobs` flag to limit total jobs collected
+- **Added**: `Matched Skills` column in CSV output
+- **Added**: `Salary Info` column in CSV output
+- **Added**: `tqdm` progress bars for description fetching
+- **Added**: Timing breakdown (search phase vs. description phase)
+- **Added**: `.env` file loading via `python-dotenv`
+- **Added**: Proxy support from `PROXY_URL` env variable
+- **Updated**: User-Agent strings to Chrome 131+ / Firefox 133+
+- **Improved**: Smart description truncation at sentence boundaries
+
+### v1.0 (2026-03-30)
+- Initial release with dual scraping strategy, stealth mode, and CSV export
+
+## Legal Notice
+
+This tool is designed for **personal, small-scale use only**. It scrapes publicly accessible data from LinkedIn's guest pages (no login required) and Jobs.bg's public search results. Always:
+- Respect each site's Terms of Service
+- Use reasonable delays between requests
+- Do not scrape personal profile data
+- Comply with applicable data protection laws (GDPR, etc.)
+
