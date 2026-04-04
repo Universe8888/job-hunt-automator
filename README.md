@@ -110,6 +110,18 @@ Open the output CSV in Excel or any spreadsheet app:
 | Matched Skills | Skills from your profile found in the description |
 | Match Flag | ✅ Good Match or — |
 
+### 7. Run the Tests & Demo
+
+The project includes an isolated test suite and a demo script that won't write to your main CSV files. It uses a mocked "John Doe" engineering profile to demonstrate the AI matching.
+
+```bash
+# Run unit tests
+python -m pytest tests/
+
+# Run the live demo scrape (Isolated output to tests/ folder)
+python tests/demo_scrape.py
+```
+
 ## CLI Reference
 
 | Flag | Description | Default |
@@ -121,6 +133,8 @@ Open the output CSV in Excel or any spreadsheet app:
 | `--headless` | Run browser without GUI | Off |
 | `--days N` | Only jobs from past N days (1, 7, 30) | All time |
 | `--max-jobs N` | Stop after N jobs | Unlimited |
+| `--output FILE` | Override the default output CSV path | `OUTPUT_CSV` |
+| `--log-file FILE` | Set a custom log file path | `scraper.log` |
 | `--verbose` | Debug logging | Off |
 
 ## Configuration
@@ -168,6 +182,9 @@ Supported variables:
 ├── .env.example             # Environment variables template
 ├── validate_dependencies.py # Dependency validation script
 ├── test_imports.py          # Basic import test
+├── tests/                   # Demo run and Pytest suite
+│   ├── demo_scrape.py       # Isolated demo scrape script
+│   └── test_profile_matcher.py # Unit tests for skill extraction
 ├── linkedin_leads.csv       # LinkedIn output (generated, git-ignored)
 ├── Jobs.bg-leads.csv        # Jobs.bg output (generated, git-ignored)
 ├── .browser_session/        # Persistent cookies (generated, git-ignored)

@@ -42,7 +42,11 @@ except ImportError:
 # Logging Setup
 # ────────────────────────────────────────
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose: bool = False, log_file: str = "scraper.log"):
+    # Remove any existing handlers if setup_logging is called multiple times
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+        
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -50,7 +54,7 @@ def setup_logging(verbose: bool = False):
         datefmt="%H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler("scraper.log", encoding="utf-8"),
+            logging.FileHandler(log_file, encoding="utf-8", mode="a"),
         ],
     )
 
@@ -163,7 +167,8 @@ class BrowserSession:
 
 async def run(args):
     print(BANNER)
-    setup_logging(verbose=args.verbose)
+    log_file = getattr(args, "log_file", "scraper.log")
+    setup_logging(verbose=args.verbose, log_file=log_file)
     logger = logging.getLogger(__name__)
 
     keywords = args.keywords if args.keywords else KEYWORDS
@@ -173,7 +178,11 @@ async def run(args):
     max_jobs = args.max_jobs or MAX_JOBS_PER_RUN
     
     selected_site = args.site if args.site else TARGET_SITE
-    if selected_site == "jobs.bg":
+    
+    if getattr(args, "output", None):
+        output_csv = args.output
+        active_scraper = jobsbg_scraper if selected_site == "jobs.bg" else linkedin_scraper
+    elif selected_site == "jobs.bg":
         active_scraper = jobsbg_scraper
         output_csv = "Jobs.bg-leads.csv"
     else:
@@ -385,6 +394,8 @@ Examples:
                         help="Maximum total jobs to collect (0 = unlimited)")
     parser.add_argument("--site", type=str, choices=["linkedin", "jobs.bg"],
                         help="Select the target site to scrape (linkedin or jobs.bg)")
+    parser.add_argument("--output", type=str, help="Override output CSV filename")
+    parser.add_argument("--log-file", type=str, default="scraper.log", help="Path to runtime log file")
 
     args = parser.parse_args()
     asyncio.run(run(args))
