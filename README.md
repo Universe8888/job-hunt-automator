@@ -1,4 +1,4 @@
-# 🔍 LinkedIn & Jobs.bg Scraper v3.0
+# 🔍 LinkedIn & Jobs.bg Scraper v3.1
 
 A local Python-based job scraper built with **Playwright** and **playwright-stealth**. Supports **LinkedIn** and **Jobs.bg** as dual scraping targets, matches jobs against your professional profile using AI-powered skill matching, and exports leads to CSV.
 
@@ -9,12 +9,15 @@ A local Python-based job scraper built with **Playwright** and **playwright-stea
 - 🕵️ **Stealth Mode** — `playwright-stealth`, realistic User-Agent rotation, randomised viewports, human-like delays
 - 🛡️ **Anti-Blocking** — Auto-dismisses modals, handles rate limits with backoff
 - 🧠 **Persistent Sessions** — Solve a captcha once; cookies are saved locally for future runs
+- 🔑 **Cookie Authentication** — One-time login mode (`--login`) saves cookies for authenticated scraping with full descriptions
 - 🛑 **Graceful Shutdown** — Close the browser window to stop the program instantly
 
 ### LinkedIn-Specific
 - 🔗 **Dual Strategy** — Guest API (fast) with full-browser fallback
+- 📄 **Guest API Detail Endpoint** — Fetches full job descriptions without navigating pages or dismissing modals
 - 🔗 **URL Validation** — Only processes valid `/jobs/view/` URLs; filters out company pages
 - 🧹 **Content Sanitisation** — Detects and discards sign-in modal garbage in descriptions
+- 📊 **Enhanced Card Parsing** — Extracts seniority, employment type, and applicant count from search results
 
 ### Jobs.bg-Specific
 - 🇧🇬 **Location Mapping** — Bulgarian city IDs (Plovdiv = `2`) mapped in config
@@ -23,7 +26,7 @@ A local Python-based job scraper built with **Playwright** and **playwright-stea
 
 ### Matching & Export
 - 🎯 **AI Profile Matching** — Scores jobs against your PDF resume (ISO 27001, SQL, Tableau, RAG/AI…)
-- 📊 **Rich CSV Export** — Deduped, UTF-8 BOM (Excel-friendly), includes matched skills & salary info
+- 📊 **Rich CSV Export** — Deduped, UTF-8 BOM (Excel-friendly), includes matched skills, salary info, seniority & employment type
 - 📂 **Separate Output Files** — `linkedin_leads.csv` for LinkedIn, `Jobs.bg-leads.csv` for Jobs.bg
 - 📈 **Progress Bars** — Live tracking during description fetching (via tqdm)
 - 📅 **Date Filters** — Only see jobs from the past day, week, or month
@@ -62,7 +65,19 @@ Place your resume/CV as `my_resume.pdf` in the project root. The scraper will au
 
 You can also use a different filename: `--profile custom_resume.pdf`
 
-### 5. Run the Scraper
+### 5. (Optional) Authenticate for Full Job Descriptions
+
+LinkedIn requires authentication to view full job descriptions. Run the one-time login mode:
+
+```bash
+python main.py --login
+```
+
+This opens a visible browser. Log in to your LinkedIn account, then close the browser. Cookies are saved to `linkedin_cookies.json` and reused automatically on future runs.
+
+> **💡 Tip:** You can also export cookies manually from your browser and save them as `linkedin_cookies.json`.
+
+### 6. Run the Scraper
 
 ```bash
 # ─── LinkedIn (default) ───────────────────────
@@ -80,11 +95,13 @@ python main.py --site jobs.bg --headless          # Headless (needs solved captc
 python main.py --profile my_resume.pdf            # Custom PDF profile
 python main.py --keywords "Data Analyst" "DevOps" # Override keywords
 python main.py --verbose                          # Debug logging
+python main.py --login                            # One-time LinkedIn login
+python main.py --cookies my_cookies.json          # Use custom cookie file
 ```
 
 > **💡 First time using Jobs.bg?** Run without `--headless` so the browser opens. If a slider captcha appears, solve it manually once. Future runs (even headless) will reuse the saved session.
 
-### 6. Review Results
+### 7. Review Results
 
 Open the output CSV in Excel or any spreadsheet app:
 
@@ -102,6 +119,9 @@ Open the output CSV in Excel or any spreadsheet app:
 | Location | City/country or Remote |
 | Posting Date | When the job was posted |
 | Salary Info | Salary range (when available) |
+| Seniority | Job seniority level (when available) |
+| Employment Type | Full-time, Part-time, Contract, etc. |
+| Applicants | Number of applicants (when available) |
 | Description | Full job description (up to 5000 chars) |
 | Job URL | Direct link to the listing |
 | Search Keyword | Which keyword matched this job |
@@ -110,7 +130,7 @@ Open the output CSV in Excel or any spreadsheet app:
 | Matched Skills | Skills from your profile found in the description |
 | Match Flag | ✅ Good Match or — |
 
-### 7. Run the Tests & Demo
+### 8. Run the Tests & Demo
 
 The project includes an isolated test suite and a demo script that won't write to your main CSV files. It uses a mocked "John Doe" engineering profile to demonstrate the AI matching.
 
@@ -135,6 +155,8 @@ python tests/demo_scrape.py
 | `--max-jobs N` | Stop after N jobs | Unlimited |
 | `--output FILE` | Override the default output CSV path | `OUTPUT_CSV` |
 | `--log-file FILE` | Set a custom log file path | `scraper.log` |
+| `--login` | One-time login mode: opens browser for you to sign in, then saves cookies | Off |
+| `--cookies FILE` | Path to a JSON cookie file for authenticated scraping | `linkedin_cookies.json` |
 | `--verbose` | Debug logging | Off |
 
 ## Configuration
@@ -171,7 +193,7 @@ Supported variables:
 ```
 ├── main.py                  # Entry point with CLI & orchestrator
 ├── config.example.py        # Template for search parameters & skill weights (copy to config.py)
-├── scraper.py               # LinkedIn scraping engine (API + browser)
+├── scraper.py               # LinkedIn scraping engine (API + browser + Guest API detail endpoint)
 ├── jobsbg_scraper.py        # Jobs.bg scraping engine
 ├── stealth_config.py        # Browser stealth & proxy configuration
 ├── csv_export.py            # CSV writer with deduplication
@@ -181,13 +203,13 @@ Supported variables:
 ├── .gitignore               # Git ignore rules
 ├── .env.example             # Environment variables template
 ├── validate_dependencies.py # Dependency validation script
-├── test_imports.py          # Basic import test
 ├── tests/                   # Demo run and Pytest suite
 │   ├── demo_scrape.py       # Isolated demo scrape script
 │   └── test_profile_matcher.py # Unit tests for skill extraction
 ├── linkedin_leads.csv       # LinkedIn output (generated, git-ignored)
 ├── Jobs.bg-leads.csv        # Jobs.bg output (generated, git-ignored)
-├── .browser_session/        # Persistent cookies (generated, git-ignored)
+├── linkedin_cookies.json    # Saved LinkedIn cookies (generated, git-ignored)
+├── .browser_session/        # Persistent browser data (generated, git-ignored)
 └── scraper.log              # Runtime log (generated, git-ignored)
 ```
 
@@ -202,9 +224,10 @@ Supported variables:
 | Selectors broken (LinkedIn) | LinkedIn changes HTML frequently — update selectors in `scraper.py` |
 | Selectors broken (Jobs.bg) | Update selectors in `jobsbg_scraper.py` (`.mdc-card`, `.job-view-left-column`) |
 | Browser closed → program hangs | v3.0 detects window close and exits cleanly |
-| Description is empty | URL was filtered or modal text was discarded; iframes are now extracted |
+| Description is empty | URL was filtered or modal text was discarded; try `--login` first for authenticated access |
 | Jobs.bg captcha blocks | Run without `--headless`, solve captcha once, then use headless |
 | Jobs.bg still blocked after captcha | Delete `.browser_session/` folder and solve captcha again |
+| Another instance already running | Remove `scraper.lock` file if no other instance is active |
 
 ### Rate Limiting (429 Errors)
 
@@ -233,7 +256,27 @@ If jobs show 0% match score:
 3. Verify skill weights in `config.py` match your resume keywords
 4. Try with `--profile your_resume.pdf` flag
 
+### Getting Full Job Descriptions
+
+LinkedIn limits description visibility for non-authenticated users. To get full descriptions:
+
+1. **One-time login:** Run `python main.py --login`, log in, then close the browser
+2. **Future runs:** Cookies are loaded automatically — descriptions will be fetched via the authenticated session
+3. **Guest API fallback:** The scraper also tries the Guest API detail endpoint (`/jobs-guest/jobs/api/jobPosting/{id}`) which sometimes returns descriptions without login
+
 ## Changelog
+
+### v3.1 (2026-04-05)
+- **Added**: `--login` flag for one-time manual login with automatic cookie saving
+- **Added**: `--cookies` flag to load cookies from a custom JSON file
+- **Added**: Guest API detail endpoint (`/jobs-guest/jobs/api/jobPosting/{id}`) for fetching descriptions without page navigation
+- **Added**: Enhanced job card parsing — extracts seniority, employment type, and applicant count
+- **Added**: New CSV columns: Seniority, Employment Type, Applicants
+- **Added**: Multi-strategy description extraction (Guest API → DOM selectors → JS injection → body fallback)
+- **Fixed**: Duplicate lock code block in `main.py` causing false "instance already running" errors
+- **Fixed**: Cookie injection into persistent browser context for authenticated scraping
+- **Improved**: Description fetcher now tries Guest API first (faster, more reliable) before browser navigation
+- **Improved**: Better modal garbage detection and filtering
 
 ### v3.0 (2026-04-03)
 - **Added**: Jobs.bg scraping engine with `--site jobs.bg` flag
@@ -276,4 +319,3 @@ This tool is designed for **personal, small-scale use only**. It scrapes publicl
 - Use reasonable delays between requests
 - Do not scrape personal profile data
 - Comply with applicable data protection laws (GDPR, etc.)
-

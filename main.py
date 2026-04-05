@@ -1,7 +1,8 @@
 """
-LinkedIn Jobs Scraper — Main Entry Point (v3.0)
+LinkedIn Jobs Scraper — Main Entry Point (v3.1)
 Orchestrates search → scrape → match → export.
-Features: real-time incremental saving, browser context recovery, progress bars.
+Features: real-time incremental saving, browser context recovery, progress bars,
+          cookie injection for authenticated description fetching, one-time login mode.
 
 Usage:
     python main.py                          # Run with default settings
@@ -11,19 +12,24 @@ Usage:
     python main.py --headless               # Run without visible browser
     python main.py --days 7                 # Only jobs from the past week
     python main.py --max-jobs 50            # Stop after 50 jobs
+    python main.py --login                  # One-time login to save session cookies
+    python main.py --cookies cookies.json   # Load cookies from a JSON file
 """
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
+import os
+import atexit
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 from config import KEYWORDS, LOCATIONS, PROFILE_PDF, OUTPUT_CSV, MAX_JOBS_PER_RUN, TARGET_SITE
-from stealth_config import get_launch_options, get_context_options, get_random_user_agent
+from stealth_config import get_launch_options, get_context_options, get_random_user_agent, apply_stealth_to_page
 from scraper import human_delay
 from csv_export import export_to_csv
 from profile_matcher import match_jobs, load_skills
@@ -39,14 +45,86 @@ except ImportError:
 
 
 # ────────────────────────────────────────
+# Single-Instance Lock
+# ────────────────────────────────────────
+
+LOCK_FILE = "scraper.lock"
+_lock_fd = None
+
+
+def _acquire_lock() -> bool:
+    """Acquire an exclusive lock to prevent multiple scraper instances."""
+    global _lock_fd
+    try:
+        _lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY | os.O_EXCL)
+        os.write(_lock_fd, str(os.getpid()).encode())
+        atexit.register(_release_lock)
+        return True
+    except FileExistsError:
+        try:
+            with open(LOCK_FILE, "r") as f:
+                old_pid = f.read().strip()
+            return False
+        except Exception:
+            os.remove(LOCK_FILE)
+            return _acquire_lock()
+
+
+def _release_lock():
+    """Release the single-instance lock."""
+    global _lock_fd
+    if _lock_fd is not None:
+        try:
+            os.close(_lock_fd)
+        except Exception:
+            pass
+        try:
+            os.remove(LOCK_FILE)
+        except Exception:
+            pass
+        _lock_fd = None
+
+
+# ────────────────────────────────────────
+# Cookie Management
+# ────────────────────────────────────────
+
+COOKIES_FILE = "linkedin_cookies.json"
+
+
+def load_cookies(filepath: str | None = None) -> list[dict]:
+    """Load LinkedIn cookies from a JSON file."""
+    path = filepath or COOKIES_FILE
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        return cookies
+    except Exception as e:
+        logging.getLogger(__name__).warning("⚠️  Failed to load cookies from %s: %s", path, str(e))
+        return []
+
+
+def save_cookies(cookies: list[dict], filepath: str | None = None):
+    """Save LinkedIn cookies to a JSON file."""
+    path = filepath or COOKIES_FILE
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, indent=2)
+        logging.getLogger(__name__).info("💾 Saved %d cookies to %s", len(cookies), path)
+    except Exception as e:
+        logging.getLogger(__name__).warning("⚠️  Failed to save cookies to %s: %s", path, str(e))
+
+
+# ────────────────────────────────────────
 # Logging Setup
 # ────────────────────────────────────────
 
 def setup_logging(verbose: bool = False, log_file: str = "scraper.log"):
-    # Remove any existing handlers if setup_logging is called multiple times
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
-        
+
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -65,10 +143,11 @@ def setup_logging(verbose: bool = False, log_file: str = "scraper.log"):
 
 BANNER = r"""
 ╔══════════════════════════════════════════════════════╗
-║       LinkedIn Jobs Scraper v3.0                     ║
+║       LinkedIn Jobs Scraper v3.1                     ║
 ║       Playwright + Stealth  │  Guest API Mode        ║
 ║       ⚡ Real-Time Saving  │  Context Recovery      ║
 ║       🔍 URL Validation   │  Content Sanitization   ║
+║       🔑 Cookie Auth      │  Enhanced Parsing       ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -92,24 +171,26 @@ class BrowserSession:
     """
     Manages browser lifecycle with automatic recovery on context death.
     Uses persistent contexts to store cookies and bypass recurring captchas.
+    Supports cookie injection for authenticated sessions.
     """
 
-    def __init__(self, playwright, headless: bool = False):
+    def __init__(self, playwright, headless: bool = False, cookies: list[dict] | None = None):
         self._playwright = playwright
         self._headless = headless
         self._context = None
         self._page = None
         self._ua = get_random_user_agent()
+        self._cookies = cookies or []
         self._logger = logging.getLogger(__name__)
 
     async def start(self):
         """Launch browser and create initial persistent context."""
         self._logger.info("🌐 Launching persistent browser (User-Agent: %s…)", self._ua[:60])
-        
+
         import os
         from config import SESSION_DIR
         os.makedirs(SESSION_DIR, exist_ok=True)
-        
+
         launch_opts = get_launch_options(self._headless)
         context_opts = get_context_options(self._ua)
         opts = {**launch_opts, **context_opts}
@@ -118,9 +199,20 @@ class BrowserSession:
             user_data_dir=SESSION_DIR,
             **opts
         )
-        
+
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
+
+        # Apply stealth scripts to prevent bot detection
+        await apply_stealth_to_page(self._page)
+
+        # Inject cookies if provided
+        if self._cookies:
+            self._logger.info("🔑 Injecting %d cookies for authenticated session…", len(self._cookies))
+            await self._context.add_cookies(self._cookies)
+            await self._page.reload(wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
+
         return self
 
     async def _new_context(self):
@@ -130,9 +222,10 @@ class BrowserSession:
                 await self._page.close()
             except Exception:
                 pass
-                
+
         try:
             self._page = await self._context.new_page()
+            await apply_stealth_to_page(self._page)
             self._logger.debug("  🔄 Created new page in persistent context")
         except Exception:
             self._logger.info("  🛑 Browser closed. Exiting...")
@@ -142,13 +235,16 @@ class BrowserSession:
     def page(self):
         return self._page
 
+    @property
+    def context(self):
+        return self._context
+
     async def ensure_alive(self) -> bool:
         """
         Check if the browser page is still alive.
         If dead (e.g. user closed it), stop the program.
         """
         try:
-            # Quick health check — try to evaluate something trivial
             await self._page.evaluate("() => 1")
             return False
         except Exception:
@@ -162,23 +258,80 @@ class BrowserSession:
 
 
 # ────────────────────────────────────────
+# Login Mode
+# ────────────────────────────────────────
+
+async def run_login_mode(headless: bool, cookies_file: str | None):
+    """Open browser for one-time manual LinkedIn login, then save cookies."""
+    async with Stealth().use_async(async_playwright()) as p:
+        session = await BrowserSession(p, headless=headless).start()
+        page = session.page
+
+        logging.info("🔐 Login mode — navigating to LinkedIn login page…")
+        logging.info("   Please log in to your LinkedIn account in the browser window.")
+        logging.info("   Once logged in, close the browser or press Ctrl+C to save cookies.")
+
+        await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=20000)
+
+        try:
+            # Wait for user to log in and close browser
+            while True:
+                try:
+                    await page.evaluate("() => 1")
+                    await asyncio.sleep(2)
+                except Exception:
+                    break
+        except KeyboardInterrupt:
+            pass
+
+        # Save cookies before exiting
+        try:
+            cookies = await session.context.cookies()
+            save_cookies(cookies, cookies_file)
+            logging.info("✅ Cookies saved successfully!")
+        except Exception as e:
+            logging.warning("⚠️  Could not save cookies: %s", str(e))
+
+        await session.close()
+
+
+# ────────────────────────────────────────
 # Main
 # ────────────────────────────────────────
 
 async def run(args):
+    # Fix Windows console encoding for Unicode banner
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
     print(BANNER)
     log_file = getattr(args, "log_file", "scraper.log")
     setup_logging(verbose=args.verbose, log_file=log_file)
     logger = logging.getLogger(__name__)
+
+    # Handle login mode
+    if getattr(args, "login", False):
+        cookies_file = getattr(args, "cookies", None) or COOKIES_FILE
+        headless = getattr(args, "headless", False)
+        if headless:
+            logger.warning("⚠️  --login mode requires a visible browser. Disabling headless.")
+            headless = False
+        await run_login_mode(headless, cookies_file)
+        return
 
     keywords = args.keywords if args.keywords else KEYWORDS
     profile_pdf = args.profile or PROFILE_PDF
     fetch_descriptions = not args.quick
     headless = args.headless
     max_jobs = args.max_jobs or MAX_JOBS_PER_RUN
-    
+
     selected_site = args.site if args.site else TARGET_SITE
-    
+
+    # jobs.bg uses DataDome captcha which blocks headless browsers
+    if "jobs" in selected_site.lower() and headless:
+        logger.warning("⚠️  jobs.bg requires a visible browser to bypass DataDome captcha.")
+        logger.warning("   Forcing non-headless mode...")
+        headless = False
+
     if getattr(args, "output", None):
         output_csv = args.output
         active_scraper = jobsbg_scraper if selected_site == "jobs.bg" else linkedin_scraper
@@ -188,6 +341,11 @@ async def run(args):
     else:
         active_scraper = linkedin_scraper
         output_csv = OUTPUT_CSV
+
+    # Load cookies for authenticated session
+    cookies_file = getattr(args, "cookies", None) or COOKIES_FILE
+    cookies = load_cookies(cookies_file)
+    auth_status = f"✅ {len(cookies)} cookies loaded" if cookies else "⚠️  No cookies (guest mode)"
 
     # Date filter
     date_filter = ""
@@ -207,6 +365,7 @@ async def run(args):
     logger.info("   Output: %s", output_csv)
     logger.info("   Total search combinations: %d", total_combinations)
     logger.info("   Headless: %s", headless)
+    logger.info("   Auth: %s", auth_status)
     if date_filter:
         logger.info("   Date filter: past %d days", args.days)
     if max_jobs:
@@ -224,7 +383,7 @@ async def run(args):
 
     # Launch browser with stealth
     async with Stealth().use_async(async_playwright()) as p:
-        session = await BrowserSession(p, headless=headless).start()
+        session = await BrowserSession(p, headless=headless, cookies=cookies).start()
         page = session.page
 
         # Warm up: visit target site homepage first (looks more natural)
@@ -368,6 +527,11 @@ async def run(args):
 # ────────────────────────────────────────
 
 def main():
+    if not _acquire_lock():
+        print(f"ERROR: Another scraper instance is already running.")
+        print(f"Remove {LOCK_FILE} if no other instance is active, then try again.")
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(
         description="LinkedIn Jobs Scraper — Scrape public job listings with AI profile matching.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -381,6 +545,8 @@ Examples:
   python main.py --days 7                        # Only jobs from past week
   python main.py --max-jobs 50                   # Stop after 50 jobs
   python main.py --verbose                       # Debug logging
+  python main.py --login                         # One-time login to save cookies
+  python main.py --cookies my_cookies.json       # Use custom cookie file
         """,
     )
     parser.add_argument("--profile", type=str, help="Path to PDF resume/profile for matching")
@@ -396,6 +562,10 @@ Examples:
                         help="Select the target site to scrape (linkedin or jobs.bg)")
     parser.add_argument("--output", type=str, help="Override output CSV filename")
     parser.add_argument("--log-file", type=str, default="scraper.log", help="Path to runtime log file")
+    parser.add_argument("--login", action="store_true",
+                        help="One-time login mode: opens browser for you to sign in, then saves cookies")
+    parser.add_argument("--cookies", type=str,
+                        help="Path to a JSON cookie file for authenticated scraping")
 
     args = parser.parse_args()
     asyncio.run(run(args))

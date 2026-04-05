@@ -18,6 +18,9 @@ CSV_COLUMNS = [
     "Location",
     "Posting Date",
     "Salary Info",
+    "Seniority",
+    "Employment Type",
+    "Applicants",
     "Description",
     "Job URL",
     "Search Keyword",
@@ -45,13 +48,30 @@ def load_existing_urls(filepath: str) -> set[str]:
     return urls
 
 
+def _has_valid_header(filepath: str) -> bool:
+    """Check if the CSV file starts with the expected header row."""
+    try:
+        with open(filepath, "r", encoding="utf-8-sig") as f:
+            first_line = f.readline().strip()
+        return first_line.startswith("Job Title")
+    except Exception:
+        return False
+
+
 def export_to_csv(jobs: list[dict], filepath: str | None = None):
     """
     Write job data to CSV.
     - Appends to existing file (deduplicates by URL).
     - Uses UTF-8 with BOM for Excel compatibility.
+    - Validates header integrity before appending.
     """
     filepath = filepath or OUTPUT_CSV
+
+    # If file exists but has no valid header, start fresh
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not _has_valid_header(filepath):
+        logger.warning("⚠️  %s has no valid header — starting fresh.", filepath)
+        os.remove(filepath)
+
     existing_urls = load_existing_urls(filepath)
     file_exists = os.path.exists(filepath) and os.path.getsize(filepath) > 0
 
@@ -84,6 +104,9 @@ def export_to_csv(jobs: list[dict], filepath: str | None = None):
                 "Location": job.get("location", ""),
                 "Posting Date": job.get("date", ""),
                 "Salary Info": job.get("salary", ""),
+                "Seniority": job.get("seniority", ""),
+                "Employment Type": job.get("employment_type", ""),
+                "Applicants": job.get("applicants_count", ""),
                 "Description": _truncate_description(job.get("description", "")),
                 "Job URL": job.get("url", ""),
                 "Search Keyword": job.get("search_keyword", ""),

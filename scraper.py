@@ -151,7 +151,10 @@ async def dismiss_sign_in_modal(page) -> bool:
 
 
 def parse_job_cards_from_html(html: str) -> list[dict]:
-    """Parse job card data from the Guest API HTML fragment."""
+    """Parse job card data from the Guest API HTML fragment.
+    Extracts: title, company, location, date, url, salary,
+              seniority, employment_type, industry, job_function, applicants_count.
+    """
     soup = BeautifulSoup(html, "lxml")
     jobs = []
 
@@ -205,18 +208,162 @@ def parse_job_cards_from_html(html: str) -> list[dict]:
         if salary_el:
             job["salary"] = salary_el.get_text(strip=True)
 
+        metadata_div = card.find("div", class_=re.compile(r"base-search-card__metadata"))
+        if not metadata_div:
+            metadata_div = card.find("div", class_=re.compile(r"job-search-card__list"))
+        if metadata_div:
+            list_items = metadata_div.find_all("li")
+            for li in list_items:
+                text = li.get_text(strip=True)
+                if any(kw in text.lower() for kw in ["seniority", "entry", "mid-senior", "associate", "director", "intern", "executive"]):
+                    job["seniority"] = text
+                elif any(kw in text.lower() for kw in ["full-time", "part-time", "contract", "temporary", "volunteer", "internship"]):
+                    job["employment_type"] = text
+
+        for badge in card.find_all("span", class_=re.compile(r"badge")):
+            text = badge.get_text(strip=True).lower()
+            if "applicants" in text or "applicant" in text:
+                job["applicants_count"] = re.sub(r"[^\d]", "", text)
+
+        footer = card.find("div", class_=re.compile(r"base-search-card__footer"))
+        if footer:
+            posted_text = footer.get_text(strip=True)
+            if "ago" in posted_text and "date" not in job:
+                job["date"] = posted_text
+
         if job.get("title"):
             jobs.append(job)
 
     return jobs
 
 
+def extract_job_id_from_url(job_url: str) -> str | None:
+    """Extract the numeric job ID from a LinkedIn job URL."""
+    match = re.search(r"/jobs/view/(\d+)", job_url)
+    return match.group(1) if match else None
+
+
+def build_job_detail_api_url(job_url: str) -> str | None:
+    """Build the Guest API URL for a specific job's full description."""
+    job_id = extract_job_id_from_url(job_url)
+    if not job_id:
+        return None
+    return f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+
+
+def parse_job_detail_from_html(html: str, job_url: str) -> str:
+    """Parse the full job description from the Guest API job detail HTML."""
+    soup = BeautifulSoup(html, "lxml")
+
+    desc_el = soup.find("div", class_=re.compile(r"show-more-less-html__markup"))
+    if desc_el:
+        text = desc_el.get_text(separator="\n", strip=True)
+        if text and len(text.strip()) > 50:
+            return text.strip()
+
+    desc_el = soup.find("div", class_=re.compile(r"description__text"))
+    if desc_el:
+        text = desc_el.get_text(separator="\n", strip=True)
+        if text and len(text.strip()) > 50:
+            return text.strip()
+
+    for sel in [".decorated-job-posting__details", ".jobs-description__content", "article"]:
+        desc_el = soup.select_one(sel)
+        if desc_el:
+            text = desc_el.get_text(separator="\n", strip=True)
+            if text and len(text.strip()) > 50:
+                clean = text.strip()
+                if not is_modal_garbage(clean):
+                    return clean
+
+    return ""
+
+
+def extract_job_id_from_url(job_url: str) -> str | None:
+    """Extract the numeric job ID from a LinkedIn job URL."""
+    match = re.search(r"/jobs/view/(\d+)", job_url)
+    return match.group(1) if match else None
+
+
+def build_job_detail_api_url(job_url: str) -> str | None:
+    """Build the Guest API URL for a specific job's full description."""
+    job_id = extract_job_id_from_url(job_url)
+    if not job_id:
+        return None
+    return f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+
+
+def parse_job_detail_from_html(html: str, job_url: str) -> str:
+    """Parse the full job description from the Guest API job detail HTML."""
+    soup = BeautifulSoup(html, "lxml")
+
+    desc_el = soup.find("div", class_=re.compile(r"show-more-less-html__markup"))
+    if desc_el:
+        text = desc_el.get_text(separator="\n", strip=True)
+        if text and len(text.strip()) > 50:
+            return text.strip()
+
+    desc_el = soup.find("div", class_=re.compile(r"description__text"))
+    if desc_el:
+        text = desc_el.get_text(separator="\n", strip=True)
+        if text and len(text.strip()) > 50:
+            return text.strip()
+
+    for sel in [".decorated-job-posting__details", ".jobs-description__content", "article"]:
+        desc_el = soup.select_one(sel)
+        if desc_el:
+            text = desc_el.get_text(separator="\n", strip=True)
+            if text and len(text.strip()) > 50:
+                clean = text.strip()
+                if not is_modal_garbage(clean):
+                    return clean
+
+    return ""
+
+
 async def fetch_job_description(page, job_url: str) -> str:
-    """Navigate to a job detail page and extract the full description."""
+    """Fetch full job description via the Guest API detail endpoint.
+    This is the most reliable method — it returns the complete HTML description
+    without needing to navigate pages, dismiss modals, or be logged in.
+    Falls back to browser-based extraction if the API fails.
+    """
     if not is_valid_job_url(job_url):
         logger.debug("  🚫 Skipping invalid URL for description: %s", job_url[:80])
         return ""
 
+    # Primary: Guest API detail endpoint
+    detail_api_url = build_job_detail_api_url(job_url)
+    if detail_api_url:
+        try:
+            response = await page.goto(detail_api_url, wait_until="domcontentloaded", timeout=10000)
+            if response and response.status == 200:
+                html = await page.content()
+                if html and len(html.strip()) > 200:
+                    desc = parse_job_detail_from_html(html, job_url)
+                    if desc and len(desc) > 50 and not is_modal_garbage(desc):
+                        logger.debug("  ✅ Got description via Guest API (%d chars)", len(desc))
+                        return desc
+                    elif desc:
+                        logger.debug("  🚫 Guest API description was modal garbage or too short")
+                else:
+                    logger.debug("  📭 Guest API returned empty response")
+            elif response:
+                logger.debug("  ⚠️  Guest API returned HTTP %d", response.status)
+        except Exception as e:
+            logger.debug("  ⚠️  Guest API detail fetch failed: %s", str(e)[:100])
+
+        # Navigate back to prepare for browser fallback
+        try:
+            await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+
+    # Fallback: Browser-based extraction
+    return await _fetch_job_description_via_browser(page, job_url)
+
+
+async def _fetch_job_description_via_browser(page, job_url: str) -> str:
+    """Fallback: Navigate to job page in browser and extract description."""
     try:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=15000)
         await human_delay(2, 4)
@@ -250,6 +397,145 @@ async def fetch_job_description(page, job_url: str) -> str:
                         return clean_text
             except Exception:
                 continue
+
+        try:
+            text = await page.evaluate("""() => {
+                const selectors = [
+                    '.show-more-less-html__markup',
+                    '.description__text',
+                    '.decorated-job-posting__details',
+                    '[class*="description"]',
+                    '.jobs-description',
+                    '.job-details',
+                    'article'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText && el.innerText.trim().length > 50) {
+                        return el.innerText.trim();
+                    }
+                }
+                return '';
+            }""")
+            if text and len(text.strip()) > 50:
+                clean_text = text.strip()
+                if is_modal_garbage(clean_text):
+                    logger.debug("  🚫 JS-extracted description was modal garbage — discarding")
+                    return ""
+                return clean_text
+        except Exception:
+            logger.debug("  ⚠️  JS extraction failed")
+
+        try:
+            body_text = await page.locator("main").first.inner_text()
+            if body_text:
+                clean_text = body_text.strip()[:3000]
+                if is_modal_garbage(clean_text):
+                    logger.debug("  🚫 Fallback description was modal garbage — discarding")
+                    return ""
+                return clean_text
+            return ""
+        except Exception:
+            return ""
+
+    except Exception as e:
+        logger.warning("  ⚠️  Failed to fetch description from %s: %s", job_url[:80], str(e)[:100])
+        return ""
+
+    # Primary: Guest API detail endpoint
+    detail_api_url = build_job_detail_api_url(job_url)
+    if detail_api_url:
+        try:
+            response = await page.goto(detail_api_url, wait_until="domcontentloaded", timeout=10000)
+            if response and response.status == 200:
+                html = await page.content()
+                if html and len(html.strip()) > 200:
+                    desc = parse_job_detail_from_html(html, job_url)
+                    if desc and len(desc) > 50 and not is_modal_garbage(desc):
+                        logger.debug("  ✅ Got description via Guest API (%d chars)", len(desc))
+                        return desc
+                    elif desc:
+                        logger.debug("  🚫 Guest API description was modal garbage or too short")
+                else:
+                    logger.debug("  📭 Guest API returned empty response")
+            elif response:
+                logger.debug("  ⚠️  Guest API returned HTTP %d", response.status)
+        except Exception as e:
+            logger.debug("  ⚠️  Guest API detail fetch failed: %s", str(e)[:100])
+
+        # Navigate back to prepare for browser fallback
+        try:
+            await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+
+    # Fallback: Browser-based extraction
+    return await _fetch_job_description_via_browser(page, job_url)
+
+
+async def _fetch_job_description_via_browser(page, job_url: str) -> str:
+    """Fallback: Navigate to job page in browser and extract description."""
+    try:
+        await page.goto(job_url, wait_until="domcontentloaded", timeout=15000)
+        await human_delay(2, 4)
+
+        await dismiss_sign_in_modal(page)
+
+        try:
+            show_more = page.locator('button[aria-label="Show more"], button.show-more-less-html__button--more')
+            if await show_more.first.is_visible(timeout=2000):
+                await show_more.first.click()
+                await asyncio.sleep(1)
+        except Exception:
+            logger.debug("  ⚠️  Could not click 'Show more' button")
+
+        desc_selectors = [
+            ".show-more-less-html__markup",
+            ".description__text",
+            ".decorated-job-posting__details",
+            'div[class*="description"]',
+        ]
+        for sel in desc_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2000):
+                    text = await el.inner_text()
+                    if text and len(text.strip()) > 50:
+                        clean_text = text.strip()
+                        if is_modal_garbage(clean_text):
+                            logger.debug("  🚫 Description was modal garbage — discarding")
+                            return ""
+                        return clean_text
+            except Exception:
+                continue
+
+        try:
+            text = await page.evaluate("""() => {
+                const selectors = [
+                    '.show-more-less-html__markup',
+                    '.description__text',
+                    '.decorated-job-posting__details',
+                    '[class*="description"]',
+                    '.jobs-description',
+                    '.job-details',
+                    'article'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText && el.innerText.trim().length > 50) {
+                        return el.innerText.trim();
+                    }
+                }
+                return '';
+            }""")
+            if text and len(text.strip()) > 50:
+                clean_text = text.strip()
+                if is_modal_garbage(clean_text):
+                    logger.debug("  🚫 JS-extracted description was modal garbage — discarding")
+                    return ""
+                return clean_text
+        except Exception:
+            logger.debug("  ⚠️  JS extraction failed")
 
         try:
             body_text = await page.locator("main").first.inner_text()

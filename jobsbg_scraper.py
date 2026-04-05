@@ -5,7 +5,10 @@ Implements identically signatured scraping functions to integrate cleanly with m
 
 import asyncio
 import random
+import re
 import logging
+import os
+from datetime import datetime, timedelta
 from urllib.parse import quote_plus, urlencode
 
 from bs4 import BeautifulSoup
@@ -16,6 +19,8 @@ from config import MAX_PAGES_PER_SEARCH, MAX_RETRIES_ON_BLOCK
 logger = logging.getLogger(__name__)
 
 RESULTS_PER_PAGE = 15
+
+DEBUG_HTML_DIR = "debug_html"
 
 
 def build_jobsbg_search_url(keyword: str, location: dict, offset: int = 0) -> str:
@@ -70,10 +75,30 @@ def parse_jobsbg_cards(html: str) -> list[dict]:
             if company_fallback:
                 job["company"] = company_fallback.get_text(strip=True)
 
+        # Date extraction
+        time_el = card.find("div", class_="secondary-text", text=re.compile(r"\d{2}\.\d{2}\.\d{4}"))
+        if not time_el:
+            # Fallback for relative dates like "today" or "yesterday"
+            time_el = card.find("div", class_="secondary-text")
+        
+        if time_el:
+            date_text = time_el.get_text(strip=True)
+            # Clean up: e.g. "20.03.2026, Ref.No:Ps_1" -> "20.03.2026"
+            match = re.search(r"(\d{2}\.\d{2}\.\d{4})", date_text)
+            if match:
+                job["date"] = match.group(1)
+            else:
+                job["date"] = date_text
+
         if job.get("title") and job.get("url"):
             jobs.append(job)
 
     return jobs
+
+
+async def _is_blocked_page(page) -> bool:
+    """No captcha checking — always returns False."""
+    return False
 
 
 async def _wait_for_captcha(page) -> bool:
@@ -94,6 +119,19 @@ async def _wait_for_captcha(page) -> bool:
 
     logger.error("  ❌ Captcha not solved within 60 seconds.")
     return False
+
+
+def _dump_debug_html(html: str, label: str):
+    """Save HTML to debug_html/ directory for inspection when scraping fails."""
+    os.makedirs(DEBUG_HTML_DIR, exist_ok=True)
+    safe_label = re.sub(r"[^a-zA-Z0-9_\-]", "_", label)[:80]
+    filename = os.path.join(DEBUG_HTML_DIR, f"{safe_label}.html")
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.warning("  📄 Debug HTML saved to %s", filename)
+    except Exception as e:
+        logger.debug("  Could not save debug HTML: %s", e)
 
 
 async def scrape_jobs(page, keyword: str, location: dict,
@@ -138,16 +176,49 @@ async def scrape_jobs(page, keyword: str, location: dict,
                 jobs = parse_jobsbg_cards(html)
 
                 if not jobs:
+                    search_label_safe = f"{keyword}_{location['name']}_page{page_num+1}"
+                    _dump_debug_html(html, search_label_safe)
                     logger.info("  📭 No more job cards found.")
                     return all_jobs
 
-                logger.info("  ✅ Found %d jobs on page %d", len(jobs), page_num + 1)
+                # Client-side date filtering
+                filtered_jobs = []
+                if date_filter:
+                    # In main.py, date_filter for 30 days is "r2592000" (seconds)
+                    days_limit = 30
+                    if date_filter == "r86400": days_limit = 1
+                    elif date_filter == "r604800": days_limit = 7
+                    elif date_filter == "r2592000": days_limit = 30
+                    
+                    limit_date = datetime.now() - timedelta(days=days_limit)
+                    
+                    for j in jobs:
+                        job_date_str = j.get("date", "")
+                        try:
+                            # Parse "20.03.2026"
+                            job_date = datetime.strptime(job_date_str, "%d.%m.%Y")
+                            if job_date >= limit_date:
+                                filtered_jobs.append(j)
+                        except Exception:
+                            # If date is relative like "today", keep it
+                            if any(word in job_date_str.lower() for word in ["today", "yesterday", "min", "hour"]):
+                                filtered_jobs.append(j)
+                            else:
+                                filtered_jobs.append(j)
+                else:
+                    filtered_jobs = jobs
 
-                for j in jobs:
+                if not filtered_jobs and jobs:
+                    logger.info("  📭 Jobs found but all were older than the date filter (%s).", date_filter)
+                    return all_jobs
+
+                logger.info("  ✅ Found %d jobs on page %d", len(filtered_jobs), page_num + 1)
+
+                for j in filtered_jobs:
                     j["search_keyword"] = keyword
                     j["search_location"] = location["name"]
 
-                all_jobs.extend(jobs)
+                all_jobs.extend(filtered_jobs)
 
                 if len(jobs) < RESULTS_PER_PAGE:
                     logger.info("  📭 Reached end of total results.")

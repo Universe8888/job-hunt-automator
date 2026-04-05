@@ -75,6 +75,10 @@ keys/
 *.pem
 *.crt
 Windows-key-open-router.md
+linkedin_cookies.json
+*.cookies.json
+linkedin_cookies.json
+*.cookies.json
 
 # ──────────────────────────────────────────────
 # Debug / Temp Files
@@ -83,6 +87,8 @@ debug_*.py
 debug_*.png
 debug_*.html
 test_jobsbg.py
+scraper.lock
+scraper.lock
 
 # OS
 .DS_Store
