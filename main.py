@@ -12,7 +12,7 @@ Usage:
     python main.py --headless               # Run without visible browser
     python main.py --days 7                 # Only jobs from the past week
     python main.py --max-jobs 50            # Stop after 50 jobs
-    python main.py --login                  # One-time login to save session cookies
+    python main.py --login                  # One-time login (⚠️ USE AT YOUR OWN RISK)
     python main.py --cookies cookies.json   # Load cookies from a JSON file
 """
 
@@ -262,12 +262,18 @@ class BrowserSession:
 # ────────────────────────────────────────
 
 async def run_login_mode(headless: bool, cookies_file: str | None):
-    """Open browser for one-time manual LinkedIn login, then save cookies."""
+    """
+    Open browser for one-time manual LinkedIn login, then save cookies.
+    ⚠️ WARNING: Using your profile for automated scraping carries a high risk
+    of account suspension or permanent banning. Use at your own risk.
+    """
     async with Stealth().use_async(async_playwright()) as p:
         session = await BrowserSession(p, headless=headless).start()
         page = session.page
 
         logging.info("🔐 Login mode — navigating to LinkedIn login page…")
+        logging.warning("⚠️  RISK WARNING: Logging in and using this account for automated scraping")
+        logging.warning("   violates LinkedIn's Terms of Service and may result in an account ban.")
         logging.info("   Please log in to your LinkedIn account in the browser window.")
         logging.info("   Once logged in, close the browser or press Ctrl+C to save cookies.")
 
@@ -545,7 +551,7 @@ Examples:
   python main.py --days 7                        # Only jobs from past week
   python main.py --max-jobs 50                   # Stop after 50 jobs
   python main.py --verbose                       # Debug logging
-  python main.py --login                         # One-time login to save cookies
+  python main.py --login                         # One-time login (⚠️ RISK)
   python main.py --cookies my_cookies.json       # Use custom cookie file
         """,
     )
@@ -563,7 +569,8 @@ Examples:
     parser.add_argument("--output", type=str, help="Override output CSV filename")
     parser.add_argument("--log-file", type=str, default="scraper.log", help="Path to runtime log file")
     parser.add_argument("--login", action="store_true",
-                        help="One-time login mode: opens browser for you to sign in, then saves cookies")
+                        help="One-time login mode: opens browser for you to sign in, then saves cookies. "
+                             "⚠️ USE AT YOUR OWN RISK: May lead to account suspension/ban.")
     parser.add_argument("--cookies", type=str,
                         help="Path to a JSON cookie file for authenticated scraping")
 

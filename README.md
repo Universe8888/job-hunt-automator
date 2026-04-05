@@ -9,7 +9,7 @@ A local Python-based job scraper built with **Playwright** and **playwright-stea
 - 🕵️ **Stealth Mode** — `playwright-stealth`, realistic User-Agent rotation, randomised viewports, human-like delays
 - 🛡️ **Anti-Blocking** — Auto-dismisses modals, handles rate limits with backoff
 - 🧠 **Persistent Sessions** — Solve a captcha once; cookies are saved locally for future runs
-- 🔑 **Cookie Authentication** — One-time login mode (`--login`) saves cookies for authenticated scraping with full descriptions
+- 🔑 **Authenticated Scraping** — One-time login mode (`--login`) saves cookies for authenticated scraping. **(⚠️ USE AT YOUR OWN RISK: Logging in for automation may lead to account suspension/banning by LinkedIn).**
 - 🛑 **Graceful Shutdown** — Close the browser window to stop the program instantly
 
 ### LinkedIn-Specific
@@ -66,6 +66,9 @@ Place your resume/CV as `my_resume.pdf` in the project root. The scraper will au
 You can also use a different filename: `--profile custom_resume.pdf`
 
 ### 5. (Optional) Authenticate for Full Job Descriptions
+
+> [!CAUTION]
+> **USE AT YOUR OWN RISK.** Using your personal LinkedIn account with automation/scraping tools violates LinkedIn's Terms of Service and may result in your account being permanently restricted or banned. If you choose to use authenticated scraping, it is highly recommended to use a burner/test account.
 
 LinkedIn requires authentication to view full job descriptions. Run the one-time login mode:
 
@@ -155,7 +158,7 @@ python tests/demo_scrape.py
 | `--max-jobs N` | Stop after N jobs | Unlimited |
 | `--output FILE` | Override the default output CSV path | `OUTPUT_CSV` |
 | `--log-file FILE` | Set a custom log file path | `scraper.log` |
-| `--login` | One-time login mode: opens browser for you to sign in, then saves cookies | Off |
+| `--login` | One-time login mode: opens browser for you to sign in, then saves cookies. (**⚠️ Account Ban Risk**) | Off |
 | `--cookies FILE` | Path to a JSON cookie file for authenticated scraping | `linkedin_cookies.json` |
 | `--verbose` | Debug logging | Off |
 
@@ -260,7 +263,7 @@ If jobs show 0% match score:
 
 LinkedIn limits description visibility for non-authenticated users. To get full descriptions:
 
-1. **One-time login:** Run `python main.py --login`, log in, then close the browser
+1. **One-time login (⚠️ RISK):** Run `python main.py --login`, log in, then close the browser
 2. **Future runs:** Cookies are loaded automatically — descriptions will be fetched via the authenticated session
 3. **Guest API fallback:** The scraper also tries the Guest API detail endpoint (`/jobs-guest/jobs/api/jobPosting/{id}`) which sometimes returns descriptions without login
 
@@ -314,7 +317,13 @@ LinkedIn limits description visibility for non-authenticated users. To get full 
 
 ## Legal Notice
 
-This tool is designed for **personal, small-scale use only**. It scrapes publicly accessible data from LinkedIn's guest pages (no login required) and Jobs.bg's public search results. Always:
+This tool is designed for **personal, small-scale use only**. It scrapes publicly accessible data from LinkedIn's guest pages (no login required) and Jobs.bg's public search results.
+
+> [!WARNING]
+> **The use of the `--login` feature is strictly at the user's own risk.**
+> Automated interaction with LinkedIn while logged in is a violation of their Terms of Service. The developers of this tool are not responsible for any account restrictions, temporary suspensions, or permanent bans that may occur as a result of using this software.
+
+Always:
 - Respect each site's Terms of Service
 - Use reasonable delays between requests
 - Do not scrape personal profile data
