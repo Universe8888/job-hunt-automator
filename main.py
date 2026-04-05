@@ -1,5 +1,5 @@
 """
-LinkedIn Jobs Scraper — Main Entry Point (v2.0)
+LinkedIn Jobs Scraper — Main Entry Point (v3.0)
 Orchestrates search → scrape → match → export.
 Features: real-time incremental saving, browser context recovery, progress bars.
 
@@ -65,7 +65,7 @@ def setup_logging(verbose: bool = False, log_file: str = "scraper.log"):
 
 BANNER = r"""
 ╔══════════════════════════════════════════════════════╗
-║       LinkedIn Jobs Scraper v2.0                     ║
+║       LinkedIn Jobs Scraper v3.0                     ║
 ║       Playwright + Stealth  │  Guest API Mode        ║
 ║       ⚡ Real-Time Saving  │  Context Recovery      ║
 ║       🔍 URL Validation   │  Content Sanitization   ║

@@ -1,5 +1,5 @@
 """
-LinkedIn Jobs Scraper — Core Scraping Engine (v2.0)
+LinkedIn Jobs Scraper — Core Scraping Engine (v3.0)
 Dual strategy: Guest API (primary) + Full browser scrape (fallback).
 Includes anti-blocking logic, URL validation, and content sanitization.
 """
@@ -29,13 +29,8 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# Regex to validate LinkedIn job URLs
 JOB_URL_PATTERN = re.compile(r"https?://[a-z]{0,3}\.?linkedin\.com/jobs/view/")
 
-
-# ────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────
 
 async def human_delay(min_s: float = MIN_DELAY, max_s: float = MAX_DELAY):
     """Sleep for a random duration to mimic human behaviour."""
@@ -63,25 +58,20 @@ def is_modal_garbage(text: str) -> bool:
 
 def build_api_url(keyword: str, location: dict, start: int = 0,
                   date_filter: str = "", experience_filters: list[str] | None = None) -> str:
-    """
-    Build a LinkedIn Guest API URL.
-    Example: /jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=...&geoId=...&f_WT=2%2C3&start=0
-    """
+    """Build a LinkedIn Guest API URL."""
     params = {
         "keywords": keyword,
         "location": location["location_text"],
         "geoId": location["geoId"],
         "f_WT": ",".join(WORK_TYPE_FILTERS),
         "start": str(start),
-        "sortBy": "DD",          # sort by date (most recent first)
+        "sortBy": "DD",
     }
 
-    # Date-posted filter
     effective_date = date_filter or DATE_POSTED_FILTER
     if effective_date:
         params["f_TPR"] = effective_date
 
-    # Experience-level filter
     effective_exp = experience_filters or EXPERIENCE_LEVEL_FILTERS
     if effective_exp:
         params["f_E"] = ",".join(effective_exp)
@@ -113,15 +103,8 @@ def build_search_url(keyword: str, location: dict,
     return f"{base}?{urlencode(params, quote_via=quote_plus)}"
 
 
-# ────────────────────────────────────────
-# Anti-Blocking: Sign-In Modal Dismissal
-# ────────────────────────────────────────
-
 async def dismiss_sign_in_modal(page) -> bool:
-    """
-    Detect and dismiss LinkedIn sign-in modals / interstitials.
-    Returns True if a modal was found and dismissed.
-    """
+    """Detect and dismiss LinkedIn sign-in modals / interstitials."""
     dismiss_selectors = [
         'button[data-tracking-control-name="public_jobs_contextual-sign-in-modal_modal_dismiss"]',
         'button[aria-label="Dismiss"]',
@@ -133,12 +116,11 @@ async def dismiss_sign_in_modal(page) -> bool:
         '.cta-modal__dismiss-btn',
     ]
 
-    # Check for modal overlay presence
     modal_visible = False
     try:
         modal_visible = await page.locator('.modal__overlay--visible, .contextual-sign-in-modal, [data-modal="true"]').first.is_visible(timeout=2000)
     except Exception:
-        pass
+        logger.debug("  ⚠️  Failed to check modal overlay visibility")
 
     if not modal_visible:
         return False
@@ -157,21 +139,16 @@ async def dismiss_sign_in_modal(page) -> bool:
         except Exception:
             continue
 
-    # Fallback: press Escape
     try:
         await page.keyboard.press("Escape")
         logger.info("  ✅ Dismissed modal via Escape key")
         await asyncio.sleep(1)
         return True
     except Exception:
-        pass
+        logger.debug("  ⚠️  Failed to press Escape key for modal dismissal")
 
     return False
 
-
-# ────────────────────────────────────────
-# Strategy 1: Guest API Scraping (Primary)
-# ────────────────────────────────────────
 
 def parse_job_cards_from_html(html: str) -> list[dict]:
     """Parse job card data from the Guest API HTML fragment."""
@@ -180,59 +157,50 @@ def parse_job_cards_from_html(html: str) -> list[dict]:
 
     cards = soup.find_all("div", class_=re.compile(r"base-card|base-search-card|job-search-card"))
     if not cards:
-        # Try broader selector
         cards = soup.find_all("li")
 
     for card in cards:
         job = {}
 
-        # Job Title
         title_el = card.find("h3", class_=re.compile(r"base-search-card__title"))
         if not title_el:
             title_el = card.find("a", class_=re.compile(r"base-card__full-link"))
         if title_el:
             job["title"] = title_el.get_text(strip=True)
 
-        # Company Name
         company_el = card.find("h4", class_=re.compile(r"base-search-card__subtitle"))
         if not company_el:
             company_el = card.find("a", class_=re.compile(r"hidden-nested-link"))
         if company_el:
             job["company"] = company_el.get_text(strip=True)
 
-        # Location
         loc_el = card.find("span", class_=re.compile(r"job-search-card__location"))
         if loc_el:
             job["location"] = loc_el.get_text(strip=True)
 
-        # Posting Date
         time_el = card.find("time")
         if time_el:
             job["date"] = time_el.get("datetime", time_el.get_text(strip=True))
 
-        # Job URL — prioritize the full-link anchor, validate it's a job page
         link_el = card.find("a", class_=re.compile(r"base-card__full-link"))
         if not link_el:
-            # Fallback: find any link that looks like a job URL
             all_links = card.find_all("a", href=True)
             for a in all_links:
                 href = a.get("href", "")
-                if "/jobs/view/" in href:
+                if href and "/jobs/view/" in href:
                     link_el = a
                     break
 
         if link_el:
             href = link_el.get("href", "")
-            # Clean tracking params
-            if "?" in href:
-                href = href.split("?")[0]
-            # Only accept valid job URLs
-            if is_valid_job_url(href):
-                job["url"] = href
-            else:
-                logger.debug("  🚫 Skipped non-job URL: %s", href[:80])
+            if href:
+                if "?" in href:
+                    href = href.split("?")[0]
+                if is_valid_job_url(href):
+                    job["url"] = href
+                else:
+                    logger.debug("  🚫 Skipped non-job URL: %s", href[:80])
 
-        # Salary info (when available)
         salary_el = card.find("span", class_=re.compile(r"job-search-card__salary-info"))
         if salary_el:
             job["salary"] = salary_el.get_text(strip=True)
@@ -253,19 +221,16 @@ async def fetch_job_description(page, job_url: str) -> str:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=15000)
         await human_delay(2, 4)
 
-        # Dismiss potential modal
         await dismiss_sign_in_modal(page)
 
-        # Try to click "Show more" if present
         try:
             show_more = page.locator('button[aria-label="Show more"], button.show-more-less-html__button--more')
             if await show_more.first.is_visible(timeout=2000):
                 await show_more.first.click()
                 await asyncio.sleep(1)
         except Exception:
-            pass
+            logger.debug("  ⚠️  Could not click 'Show more' button")
 
-        # Extract description
         desc_selectors = [
             ".show-more-less-html__markup",
             ".description__text",
@@ -279,7 +244,6 @@ async def fetch_job_description(page, job_url: str) -> str:
                     text = await el.inner_text()
                     if text and len(text.strip()) > 50:
                         clean_text = text.strip()
-                        # Validate: reject sign-in modal garbage
                         if is_modal_garbage(clean_text):
                             logger.debug("  🚫 Description was modal garbage — discarding")
                             return ""
@@ -287,7 +251,6 @@ async def fetch_job_description(page, job_url: str) -> str:
             except Exception:
                 continue
 
-        # Fallback: get the main content area
         try:
             body_text = await page.locator("main").first.inner_text()
             if body_text:
@@ -307,10 +270,7 @@ async def fetch_job_description(page, job_url: str) -> str:
 
 async def scrape_via_api(page, keyword: str, location: dict,
                          date_filter: str = "", experience_filters: list[str] | None = None) -> list[dict]:
-    """
-    Primary strategy: Fetch job listings from the Guest API endpoint.
-    Returns a list of job dicts.
-    """
+    """Primary strategy: Fetch job listings from the Guest API endpoint."""
     all_jobs = []
     retries = 0
     consecutive_empty = 0
@@ -338,7 +298,6 @@ async def scrape_via_api(page, keyword: str, location: dict,
 
             html = await page.content()
 
-            # Check if we got meaningful content
             if not html or len(html.strip()) < 100:
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
@@ -369,17 +328,12 @@ async def scrape_via_api(page, keyword: str, location: dict,
     return all_jobs
 
 
-# ────────────────────────────────────────
-# Strategy 2: Full Browser Scrape (Fallback)
-# ────────────────────────────────────────
-
 async def scroll_page_to_load_all(page, max_scrolls: int = 8):
     """Scroll the page gradually to trigger infinite-scroll loading."""
     for i in range(max_scrolls):
         await page.mouse.wheel(0, random.randint(600, 1200))
         await human_delay(SCROLL_MIN_DELAY, SCROLL_MAX_DELAY)
 
-        # Check for "See more jobs" button
         try:
             see_more = page.locator('button[aria-label="See more jobs"], button.infinite-scroller__show-more-button')
             if await see_more.first.is_visible(timeout=1000):
@@ -387,17 +341,14 @@ async def scroll_page_to_load_all(page, max_scrolls: int = 8):
                 logger.info("  📜 Clicked 'See more jobs' button")
                 await human_delay(2, 4)
         except Exception:
-            pass
+            logger.debug("  ⚠️  No 'See more jobs' button found")
 
-        # Dismiss modal if it pops up during scrolling
         await dismiss_sign_in_modal(page)
 
 
 async def scrape_via_browser(page, keyword: str, location: dict,
                              date_filter: str = "", experience_filters: list[str] | None = None) -> list[dict]:
-    """
-    Fallback strategy: Full browser-based scraping with infinite scroll.
-    """
+    """Fallback strategy: Full browser-based scraping with infinite scroll."""
     url = build_search_url(keyword, location, date_filter, experience_filters)
     logger.info("  🌐 Browser fallback — %s", url[:120])
 
@@ -407,13 +358,9 @@ async def scrape_via_browser(page, keyword: str, location: dict,
         await page.goto(url, wait_until="domcontentloaded", timeout=20000)
         await human_delay(3, 5)
 
-        # Dismiss initial modal
         await dismiss_sign_in_modal(page)
-
-        # Scroll to load more results
         await scroll_page_to_load_all(page)
 
-        # Parse the rendered DOM
         html = await page.content()
         jobs = parse_job_cards_from_html(html)
 
@@ -429,10 +376,6 @@ async def scrape_via_browser(page, keyword: str, location: dict,
     return all_jobs
 
 
-# ────────────────────────────────────────
-# Orchestrator: Run Both Strategies
-# ────────────────────────────────────────
-
 async def scrape_jobs(page, keyword: str, location: dict,
                       fetch_descriptions: bool = True,
                       date_filter: str = "",
@@ -440,16 +383,14 @@ async def scrape_jobs(page, keyword: str, location: dict,
     """
     Scrape jobs for a given keyword + location.
     Tries the Guest API first; falls back to browser scraping.
-    NOTE: In v2, description fetching is handled by main.py for real-time saving.
+    NOTE: Description fetching is handled by main.py for real-time saving.
           This function returns basic job data only.
     """
     search_label = f'"{keyword}" in {location["name"]}'
     logger.info("🔍 Searching: %s", search_label)
 
-    # Strategy 1: Guest API
     jobs = await scrape_via_api(page, keyword, location, date_filter, experience_filters)
 
-    # Strategy 2: Browser fallback
     if not jobs:
         logger.info("  🔄 API returned no results. Trying browser fallback…")
         jobs = await scrape_via_browser(page, keyword, location, date_filter, experience_filters)
@@ -458,7 +399,6 @@ async def scrape_jobs(page, keyword: str, location: dict,
         logger.warning("  ⚠️  No jobs found for: %s", search_label)
         return []
 
-    # Tag each job with search metadata
     for job in jobs:
         job["search_keyword"] = keyword
         job["search_location"] = location["name"]

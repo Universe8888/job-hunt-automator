@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dependency validation script for LinkedIn Scraper v2.0.
+Dependency validation script for LinkedIn Scraper v3.0.
 Checks if all required packages are installed and Playwright is properly set up.
 """
 
@@ -172,7 +172,7 @@ def check_content_validation():
 
 def main():
     print("=" * 60)
-    print("LinkedIn Scraper v2.0 — Dependency Validation")
+    print("LinkedIn Scraper v3.0 — Dependency Validation")
     print("=" * 60)
     
     checks_passed = []

@@ -1,5 +1,5 @@
 """
-LinkedIn Jobs Scraper — CSV Export (v2.0)
+LinkedIn Jobs Scraper — CSV Export (v3.0)
 Writes scraped jobs to a CSV with deduplication and UTF-8 BOM for Excel.
 Now includes Matched Skills and Salary Info columns.
 """
@@ -40,8 +40,8 @@ def load_existing_urls(filepath: str) -> set[str]:
                 url = row.get("Job URL", "").strip()
                 if url:
                     urls.add(url)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("⚠️  Failed to load existing URLs from %s: %s", filepath, str(e))
     return urls
 
 
