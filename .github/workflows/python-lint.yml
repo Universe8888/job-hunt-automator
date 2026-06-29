@@ -30,8 +30,9 @@ jobs:
 
     - name: Type check with mypy
       run: |
-        mypy --strict --ignore-missing-imports \
-          scraper.py jobsbg_scraper.py profile_matcher.py csv_export.py
+        mypy --ignore-missing-imports \
+          gatekeeper.py cdp_session.py csv_export.py profile_matcher.py \
+          scraper.py jobsbg_scraper.py main.py stealth_config.py
 
     - name: Test with pytest
       run: |

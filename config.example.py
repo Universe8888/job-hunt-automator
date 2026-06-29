@@ -69,7 +69,7 @@ DATE_POSTED_FILTER = ""  # Default: no filter
 # 3 = Associate, 4 = Mid-Senior level,
 # 5 = Director, 6 = Executive
 # ──────────────────────────────────────────────
-EXPERIENCE_LEVEL_FILTERS = []  # Default: no filter — e.g. ["3", "4"] for Associate + Mid-Senior
+EXPERIENCE_LEVEL_FILTERS: list[str] = []  # Default: no filter — e.g. ["3", "4"] for Associate + Mid-Senior
 
 # ──────────────────────────────────────────────
 # Pagination

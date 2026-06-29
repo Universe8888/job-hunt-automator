@@ -24,6 +24,7 @@ import sys
 import time
 import os
 import atexit
+from typing import Any
 
 # NOTE: playwright / playwright_stealth are optional, heavyweight scraping
 # dependencies. They are imported lazily inside the two coroutines that
@@ -181,11 +182,12 @@ class BrowserSession:
     Supports cookie injection for authenticated sessions.
     """
 
-    def __init__(self, playwright, headless: bool = False, cookies: list[dict] | None = None):
+    def __init__(self, playwright: Any, headless: bool = False, cookies: list[dict] | None = None):
         self._playwright = playwright
         self._headless = headless
-        self._context = None
-        self._page = None
+        # Playwright objects (typed Any — package stubs aren't import-safe here).
+        self._context: Any = None
+        self._page: Any = None
         self._ua = get_random_user_agent()
         self._cookies = cookies or []
         self._logger = logging.getLogger(__name__)

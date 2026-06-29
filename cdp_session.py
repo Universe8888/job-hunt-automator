@@ -27,6 +27,7 @@ Notes:
 import asyncio
 import logging
 import random
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +64,13 @@ async def human_pace(job_index: int) -> None:
 class CDPSession:
     """Minimal stand-in for BrowserSession that attaches to a running browser."""
 
-    def __init__(self, playwright, endpoint: str = DEFAULT_CDP_ENDPOINT):
+    def __init__(self, playwright: Any, endpoint: str = DEFAULT_CDP_ENDPOINT):
         self._playwright = playwright
         self._endpoint = endpoint
-        self._browser = None
-        self._context = None
-        self._page = None
+        # Playwright objects (typed Any — the package's stubs aren't import-safe here).
+        self._browser: Any = None
+        self._context: Any = None
+        self._page: Any = None
         self._opened_own_tab = False   # True if WE created the tab (so close() owns it)
         self._logger = logging.getLogger(__name__)
 

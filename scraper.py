@@ -183,7 +183,7 @@ def parse_job_cards_from_html(html: str) -> list[dict]:
 
         time_el = card.find("time")
         if time_el:
-            job["date"] = time_el.get("datetime", time_el.get_text(strip=True))
+            job["date"] = str(time_el.get("datetime", time_el.get_text(strip=True)))
 
         link_el = card.find("a", class_=re.compile(r"base-card__full-link"))
         if not link_el:
@@ -195,7 +195,7 @@ def parse_job_cards_from_html(html: str) -> list[dict]:
                     break
 
         if link_el:
-            href = link_el.get("href", "")
+            href = str(link_el.get("href", "") or "")
             if href:
                 if "?" in href:
                     href = href.split("?")[0]

@@ -100,17 +100,18 @@ def get_launch_options(headless: bool | None = None) -> dict:
             "--disable-features=IsolateOrigins,site-per-process",
         ]
 
-    options = {
-        "headless": use_headless,
-        "args": args,
-    }
     if use_headless:
         # Use new headless mode (more stealthy)
-        options["args"].append("--headless=new")
-        options["args"].extend([
+        args.append("--headless=new")
+        args.extend([
             "--window-size=1920,1080",
             "--disable-gpu",
         ])
+
+    options: dict = {
+        "headless": use_headless,
+        "args": args,
+    }
 
     if PROXY_URL:
         options["proxy"] = {"server": PROXY_URL}

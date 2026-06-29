@@ -240,7 +240,7 @@ async def scrape_jobs(page, keyword: str, location: dict,
     search_label = f'"{keyword}" in {location["name"]}'
     logger.info("🔍 Searching Jobs.bg: %s", search_label)
 
-    all_jobs = []
+    all_jobs: list[dict] = []
 
     for page_num in range(MAX_PAGES_PER_SEARCH):
         offset = page_num * RESULTS_PER_PAGE

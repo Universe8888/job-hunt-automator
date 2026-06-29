@@ -101,7 +101,7 @@ REJECTS_COLUMNS = [
 
 def load_existing_urls(filepath: str) -> set[str]:
     """Load existing job URLs from CSV for deduplication."""
-    urls = set()
+    urls: set[str] = set()
     if not os.path.exists(filepath):
         return urls
     try:
