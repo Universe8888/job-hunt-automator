@@ -1,14 +1,32 @@
-# 🔍 LinkedIn & Jobs.bg Scraper v3.1
+# 🔍 LinkedIn & Jobs.bg Scraper v3.2
 
-A local Python-based job scraper built with **Playwright** and **playwright-stealth**. Supports **LinkedIn** and **Jobs.bg** as dual scraping targets, matches jobs against your professional profile using AI-powered skill matching, and exports leads to CSV.
+A local Python-based job scraper built with **Playwright** and **playwright-stealth**. Supports **LinkedIn** and **Jobs.bg** as dual scraping targets, then runs each posting through a configurable **3-gate filter** that decides **keep / manual-review / reject** — so you surface the rare strong matches instead of drowning in noise — and exports the results to CSV.
+
+## The 3-Gate Filter
+
+Earlier versions only *scored* every job and surfaced everything. v3.2 turns the post-processing into a **filter**: each posting is graded on three independent gates and assigned a verdict.
+
+| Gate | Question | Source |
+|------|----------|--------|
+| **1 — Lane** | Is this the *kind* of role you want? | Title + body keyword match (`LANE_ALLOW` strong/weak vs `LANE_DENY`) |
+| **2 — Geo** | Is the location/work-arrangement acceptable? | Location field + body (`LOCATION_ALLOW` / `DENY` / `SOFT`) |
+| **3 — Ceiling** | Does the comp clear your floor? | Parsed salary, FX-normalised to EUR/yr gross, vs configurable thresholds |
+
+**Verdict precedence:** `reject` if **any** gate hard-fails → else `manual_review` if **any** gate is soft (e.g. undisclosed comp, hybrid geo) → else `keep`. Results are ranked (`w_lane·lane + w_geo·geo + w_comp·comp`) so apply-first roles sit on top.
+
+- **Nothing is silently dropped** — rejects go to a separate audit CSV with the failing gate + reason.
+- **The skill score is informational only** — the gates decide the verdict, not the legacy match percentage.
+- **Everything is configurable** in `config.py` — keyword lists, geo rules, and salary thresholds are yours to define.
 
 ## Features
 
 ### Core Engine
 - 🔍 **Multi-Site Scraping** — Toggle between LinkedIn and Jobs.bg with `--site`
+- 🚦 **3-Gate Filter** — Lane × Geo × Ceiling → keep / manual_review / reject, with ranked output
 - 🕵️ **Stealth Mode** — `playwright-stealth`, realistic User-Agent rotation, randomised viewports, human-like delays
 - 🛡️ **Anti-Blocking** — Auto-dismisses modals, handles rate limits with backoff
 - 🧠 **Persistent Sessions** — Solve a captcha once; cookies are saved locally for future runs
+- 🔌 **CDP Attach Mode** (`--cdp`) — Scrape jobs.bg through your own already-open, human-cleared browser to get past DataDome's anti-bot wall (see [Jobs.bg & DataDome](#jobsbg--datadome))
 - 🔑 **Authenticated Scraping** — One-time login mode (`--login`) saves cookies for authenticated scraping. **(⚠️ USE AT YOUR OWN RISK: Logging in for automation may lead to account suspension/banning by LinkedIn).**
 - 🛑 **Graceful Shutdown** — Close the browser window to stop the program instantly
 
@@ -25,9 +43,9 @@ A local Python-based job scraper built with **Playwright** and **playwright-stea
 - 🖼️ **Iframe Extraction** — Grabs job descriptions embedded in HTML iframes
 
 ### Matching & Export
-- 🎯 **AI Profile Matching** — Scores jobs against your PDF resume (ISO 27001, SQL, Tableau, RAG/AI…)
-- 📊 **Rich CSV Export** — Deduped, UTF-8 BOM (Excel-friendly), includes matched skills, salary info, seniority & employment type
-- 📂 **Separate Output Files** — `linkedin_leads.csv` for LinkedIn, `Jobs.bg-leads.csv` for Jobs.bg
+- 🎯 **AI Profile Matching** — Scores jobs against your PDF resume (info-only column; the gates decide the verdict)
+- 📊 **Two-CSV Output** — A **leads** CSV (`keep` + `manual_review`, sorted by rank) and a separate **rejects** audit CSV (failing gate + reasons) so a false-reject is never lost
+- 📊 **Rich CSV Export** — Deduped, UTF-8 BOM (Excel-friendly), includes verdict, gate statuses, parsed comp, matched skills, salary info, seniority & employment type
 - 📈 **Progress Bars** — Live tracking during description fetching (via tqdm)
 - 📅 **Date Filters** — Only see jobs from the past day, week, or month
 
@@ -92,7 +110,7 @@ python main.py --days 7 --max-jobs 50             # Past week, limit 50
 # ─── Jobs.bg ──────────────────────────────────
 python main.py --site jobs.bg                     # Scrape Jobs.bg (headed, recommended)
 python main.py --site jobs.bg --max-jobs 100      # Limit to 100 jobs
-python main.py --site jobs.bg --headless          # Headless (needs solved captcha first)
+python main.py --site jobs.bg --cdp --days 7      # Attach to your cleared browser (DataDome bypass)
 
 # ─── Common Options ───────────────────────────
 python main.py --profile my_resume.pdf            # Custom PDF profile
@@ -102,36 +120,38 @@ python main.py --login                            # One-time LinkedIn login
 python main.py --cookies my_cookies.json          # Use custom cookie file
 ```
 
-> **💡 First time using Jobs.bg?** Run without `--headless` so the browser opens. If a slider captcha appears, solve it manually once. Future runs (even headless) will reuse the saved session.
+> **💡 First time using Jobs.bg?** Jobs.bg is protected by **DataDome**, which blocks fresh automated browsers. The reliable path is `--cdp` mode — see [Jobs.bg & DataDome](#jobsbg--datadome) below.
 
 ### 7. Review Results
 
-Open the output CSV in Excel or any spreadsheet app:
+Each run writes **two** CSVs per site — a **leads** file (kept + manual-review, ranked) and a **rejects** audit file:
 
-| Site | Output File |
-|------|-------------|
-| LinkedIn | `linkedin_leads.csv` |
-| Jobs.bg | `Jobs.bg-leads.csv` |
+| Site | Leads CSV | Rejects CSV |
+|------|-----------|-------------|
+| LinkedIn | `linkedin_leads.csv` | `linkedin_leads-rejects.csv` |
+| Jobs.bg | `Jobs.bg-leads.csv` | `Jobs.bg-rejects.csv` |
 
-#### CSV Columns
+#### Leads CSV Columns
 
 | Column | Description |
 |--------|-------------|
+| Verdict | `keep` or `manual_review` |
+| Rank | Sort key (higher = apply-first) |
 | Job Title | Position name |
 | Company Name | Hiring company |
 | Location | City/country or Remote |
 | Posting Date | When the job was posted |
-| Salary Info | Salary range (when available) |
-| Seniority | Job seniority level (when available) |
-| Employment Type | Full-time, Part-time, Contract, etc. |
-| Applicants | Number of applicants (when available) |
+| Salary Info | Raw salary text (when available) |
+| Parsed Comp (EUR/yr gross) | Normalised comp used by Gate 3 |
+| Gate1 Lane / Gate2 Geo / Gate3 Ceiling | Per-gate status (`pass` / `soft` / `hard_fail`) |
+| Gate Reasons | Why each gate decided as it did |
+| Seniority / Employment Type / Applicants | Card metadata (when available) |
 | Description | Full job description (up to 5000 chars) |
 | Job URL | Direct link to the listing |
-| Search Keyword | Which keyword matched this job |
-| Search Location | Which location search found it |
-| Match Score | 0–100% match against your profile |
-| Matched Skills | Skills from your profile found in the description |
-| Match Flag | ✅ Good Match or — |
+| Search Keyword / Search Location | Which search found it |
+| Match Score / Matched Skills | Legacy skill overlap (info-only) |
+
+The **rejects** CSV carries `Failing Gates` + `Reject Reasons` instead of Verdict/rank, so you can audit anything the filter dropped.
 
 ### 8. Run the Tests & Demo
 
@@ -160,6 +180,8 @@ python tests/demo_scrape.py
 | `--log-file FILE` | Set a custom log file path | `scraper.log` |
 | `--login` | One-time login mode: opens browser for you to sign in, then saves cookies. (**⚠️ Account Ban Risk**) | Off |
 | `--cookies FILE` | Path to a JSON cookie file for authenticated scraping | `linkedin_cookies.json` |
+| `--cdp` | Attach to a running, human-cleared browser over CDP (jobs.bg / DataDome bypass) | Off |
+| `--cdp-endpoint URL` | CDP endpoint to attach to | `http://127.0.0.1:9222` |
 | `--verbose` | Debug logging | Off |
 
 ## Configuration
@@ -172,9 +194,13 @@ Copy `config.example.py` to `config.py` and edit it to customise:
 - **Work Types** — Remote (2), Hybrid (3), On-site (1)
 - **Date Filter** — Default date range for job postings
 - **Experience Levels** — Internship, Entry, Associate, Mid-Senior, Director, Executive
-- **Skill Weights** — Primary (1.0), Domain (0.8), Tools (0.5)
-- **Delays** — Min/max seconds between requests
-- **Match Threshold** — Minimum score to flag as "Good Match"
+- **Gate 1 — Lane** — `LANE_ALLOW` (strong terms) + `LANE_ALLOW_WEAK` (broad terms; need ≥2 to pass alone) + `LANE_DENY` (operator-lane penalties) + `TITLE_HARD_DENY` (instant-reject titles)
+- **Gate 2 — Geo** — `LOCATION_ALLOW` / `LOCATION_DENY` / `LOCATION_SOFT` keyword lists
+- **Gate 3 — Ceiling** — `SALARY_GOAL_EUR` / `SALARY_FLOOR_EUR` / `SALARY_AUTO_REJECT_BELOW_EUR`, plus `FX_RATES` and `NET_TO_GROSS_FACTOR` for normalisation
+- **Rank Weights** — `RANK_WEIGHTS` ({w_lane, w_geo, w_comp}) for ordering kept leads
+- **Skill Weights** — Primary (1.0), Domain (0.8), Tools (0.5) — info-only since v3.2
+- **Delays** — Min/max seconds between requests; `CDP_*` knobs pace `--cdp` runs to stay under DataDome's radar
+- **Match Threshold** — Minimum skill-overlap score for the info-only "Good Match" label
 - **Session Directory** — Where persistent browser cookies are stored
 
 ### Environment Variables
@@ -194,27 +220,54 @@ Supported variables:
 ## Project Structure
 
 ```
-├── main.py                  # Entry point with CLI & orchestrator
-├── config.example.py        # Template for search parameters & skill weights (copy to config.py)
+├── main.py                  # Entry point with CLI & orchestrator (fetch → score → gate → route)
+├── config.example.py        # Template: search params, gate keyword lists & thresholds (copy to config.py)
+├── gatekeeper.py            # 3-gate filter engine: evaluate(job) → Verdict (keep/manual_review/reject)
 ├── scraper.py               # LinkedIn scraping engine (API + browser + Guest API detail endpoint)
-├── jobsbg_scraper.py        # Jobs.bg scraping engine
-├── stealth_config.py        # Browser stealth & proxy configuration
-├── csv_export.py            # CSV writer with deduplication
-├── profile_matcher.py       # Profile matching with load_skills()
+├── jobsbg_scraper.py        # Jobs.bg scraping engine (+ DataDome detection, detail-page geo)
+├── cdp_session.py           # CDP attach mode + human pacing (jobs.bg DataDome bypass)
+├── stealth_config.py        # Browser stealth, real-browser channel & proxy configuration
+├── csv_export.py            # Two-CSV writer (leads + rejects) with dedup & rank sort
+├── profile_matcher.py       # Skill scoring (info-only since v3.2)
 ├── requirements.txt         # Python dependencies
 ├── README.md                # This file
 ├── .gitignore               # Git ignore rules
 ├── .env.example             # Environment variables template
 ├── validate_dependencies.py # Dependency validation script
-├── tests/                   # Demo run and Pytest suite
+├── tests/                   # Pytest suite + demo
 │   ├── demo_scrape.py       # Isolated demo scrape script
+│   ├── test_gatekeeper.py   # 3-gate filter unit tests
+│   ├── test_cdp_session.py  # CDP tab-ownership tests
 │   └── test_profile_matcher.py # Unit tests for skill extraction
-├── linkedin_leads.csv       # LinkedIn output (generated, git-ignored)
-├── Jobs.bg-leads.csv        # Jobs.bg output (generated, git-ignored)
+├── Jobs.bg-leads.csv        # Jobs.bg leads (generated, git-ignored)
+├── Jobs.bg-rejects.csv      # Jobs.bg rejects audit (generated, git-ignored)
 ├── linkedin_cookies.json    # Saved LinkedIn cookies (generated, git-ignored)
 ├── .browser_session/        # Persistent browser data (generated, git-ignored)
 └── scraper.log              # Runtime log (generated, git-ignored)
 ```
+
+## Jobs.bg & DataDome
+
+Jobs.bg is fronted by **DataDome**, a commercial anti-bot service. It fingerprints the *browser environment* and *navigation pattern* — not just your IP — so a fresh Playwright browser (bundled Chromium, real Chrome, or Edge) gets a hard block (`403` / "Please enable JS and disable any ad blocker") even with stealth patches and a matching user-agent.
+
+The reliable workaround is **`--cdp` mode**: you solve DataDome once as a human, and the scraper rides that already-cleared session.
+
+```bash
+# 1. Launch your real browser with a remote-debugging port (close other windows of it first):
+#    Edge:   msedge.exe  --remote-debugging-port=9222
+#    Chrome: chrome.exe  --remote-debugging-port=9222
+
+# 2. In that browser, open jobs.bg and solve the DataDome challenge once (until listings show).
+
+# 3. Run the scraper attached to that cleared session:
+python main.py --site jobs.bg --cdp --days 7
+```
+
+How it works: the scraper connects over the Chrome DevTools Protocol, **reuses your existing browser context** (inheriting the DataDome clearance cookie), and runs the search + description fetches through it. It opens its own tab (and cleans it up afterwards) without touching your other tabs.
+
+**Pacing:** sustained machine-speed requests will make DataDome re-challenge even a cleared session. `--cdp` mode therefore paces each fetch with a randomised delay plus a periodic longer pause (tunable via the `CDP_*` knobs in `config.py`). Expect roughly 20–30s per job — deliberately human.
+
+> **Note:** This is a *personal, small-scale* technique for scraping data you can already see in your own browser. Respect jobs.bg's Terms of Service and keep volumes low.
 
 ## Troubleshooting
 
@@ -228,8 +281,8 @@ Supported variables:
 | Selectors broken (Jobs.bg) | Update selectors in `jobsbg_scraper.py` (`.mdc-card`, `.job-view-left-column`) |
 | Browser closed → program hangs | v3.0 detects window close and exits cleanly |
 | Description is empty | URL was filtered or modal text was discarded; try `--login` first for authenticated access |
-| Jobs.bg captcha blocks | Run without `--headless`, solve captcha once, then use headless |
-| Jobs.bg still blocked after captcha | Delete `.browser_session/` folder and solve captcha again |
+| Jobs.bg blocked / "Please enable JS" / 403 | DataDome is blocking automation — use `--cdp` mode (see [Jobs.bg & DataDome](#jobsbg--datadome)) |
+| Jobs.bg re-challenges mid-run | Requests too fast — `--cdp` mode paces automatically; raise the `CDP_*` delays in config |
 | Another instance already running | Remove `scraper.lock` file if no other instance is active |
 
 ### Rate Limiting (429 Errors)
@@ -268,6 +321,18 @@ LinkedIn limits description visibility for non-authenticated users. To get full 
 3. **Guest API fallback:** The scraper also tries the Guest API detail endpoint (`/jobs-guest/jobs/api/jobPosting/{id}`) which sometimes returns descriptions without login
 
 ## Changelog
+
+### v3.2 (2026-06-29)
+- **Added**: 3-gate filter (`gatekeeper.py`) — lane × geo × ceiling → `keep` / `manual_review` / `reject`, replacing score-only surfacing
+- **Added**: Two-CSV output — a ranked **leads** file and a separate **rejects** audit file (nothing silently dropped)
+- **Added**: `--cdp` / `--cdp-endpoint` — attach to a human-cleared browser to scrape jobs.bg past DataDome, with human-paced fetching (`CDP_*` config)
+- **Added**: Weighted lane matching (`LANE_ALLOW_WEAK`) so generic roles don't pass on a single broad keyword like "python"
+- **Added**: Comp parser — currency/period/net-gross detection, FX-normalisation to EUR/yr gross, day/week/hour-rate annualisation, range → top-of-range
+- **Added**: DataDome-aware, content-based block detection for jobs.bg; detail-page location extraction feeding Gate 2
+- **Changed**: Skill score demoted to an info-only CSV column (the gates decide the verdict)
+- **Changed**: Run summary is now verdict-based (keep / manual_review / reject counts + top-ranked leads)
+- **Fixed**: Comp gate — weekly/hourly rates now annualised; cleanly-disclosed below-floor figures correctly hard-fail
+- **Fixed**: Removed duplicated dead description-fetch functions in `scraper.py`
 
 ### v3.1 (2026-04-05)
 - **Added**: `--login` flag for one-time manual login with automatic cookie saving
