@@ -23,6 +23,12 @@ jobs:
         pip install flake8 pytest mypy
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+    - name: Create config from template
+      # config.py is git-ignored (holds personal search/gate settings); the test
+      # suite imports it, so a clean CI checkout must materialise it from the
+      # committed template — the same first step a new user takes.
+      run: cp config.example.py config.py
+
     - name: Lint with flake8
       run: |
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
