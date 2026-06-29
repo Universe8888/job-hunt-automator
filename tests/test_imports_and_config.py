@@ -149,7 +149,11 @@ class TestCsvHeaders:
             assert header in CSV_COLUMNS, f"Missing header: {header}"
 
     def test_header_count(self):
-        assert len(CSV_COLUMNS) == 12
+        # 3-gate rebuild extended the legacy CSV_COLUMNS alias 12 -> 15
+        # (Seniority / Employment Type / Applicants). The original 12 names are
+        # still asserted by test_all_expected_headers_present; the live exporters
+        # use the 22-col LEADS_COLUMNS / REJECTS_COLUMNS.
+        assert len(CSV_COLUMNS) == 15
 
 
 class TestProfileMatcherStructure:

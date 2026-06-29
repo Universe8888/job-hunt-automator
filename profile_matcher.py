@@ -1,6 +1,13 @@
 """
-LinkedIn Jobs Scraper — Profile Matcher
+LinkedIn Jobs Scraper — Profile Matcher (INFO-ONLY)
+
 Extracts text from a PDF resume and scores job descriptions against weighted skills.
+
+IMPORTANT: This module is **informational only**. It produces a legacy skill
+`match_score` / `matched_skills` / `match_flag` for display and tie-breaking, but it
+decides **no** keep / manual_review / reject verdict. The 3-gate filter in
+`gatekeeper.py` owns the verdict (lane × geo × ceiling); `MATCH_THRESHOLD` here is
+purely a labelling cutoff for the info column, never a pass/fail gate.
 """
 
 import os
@@ -123,8 +130,12 @@ def match_jobs(
     skills: dict[str, float] | None = None,
 ) -> list[dict]:
     """
-    Run profile matching on all scraped jobs.
-    Adds 'match_score', 'matched_skills', and 'match_flag' fields to each job dict.
+    Annotate all scraped jobs with the legacy skill-match INFO fields.
+
+    Adds 'match_score', 'matched_skills', and 'match_flag' to each job dict.
+    These are **informational only** — they do NOT decide any keep/reject
+    verdict. gatekeeper.evaluate() owns the verdict; match_score is available
+    downstream purely as a display column and an optional rank tie-breaker.
 
     Args:
         jobs: list of job dicts
@@ -135,8 +146,8 @@ def match_jobs(
     if skills is None:
         skills = load_skills(profile_pdf_path)
 
-    # Score each job
-    matched_count = 0
+    # Score each job (INFO-ONLY — no verdict is decided here)
+    above_threshold = 0
     for job in jobs:
         desc = job.get("description", "")
         title = job.get("title", "")
@@ -147,13 +158,18 @@ def match_jobs(
         job["match_score"] = score
         job["matched_skills"] = matched_skills
 
+        # match_flag is a neutral INFO label describing skill overlap only.
+        # It is NOT a keep/reject signal — the 3-gate filter (gatekeeper.py)
+        # decides the verdict. The "✅ Good Match" / "—" prefixes are kept as a
+        # stable info marker for skim-reading the legacy skill column.
         if score >= MATCH_THRESHOLD:
-            job["match_flag"] = f"✅ Good Match ({score}%)"
-            matched_count += 1
+            job["match_flag"] = f"✅ Good Match ({score}% skill overlap — info only)"
+            above_threshold += 1
         else:
-            job["match_flag"] = f"— ({score}%)"
+            job["match_flag"] = f"— ({score}% skill overlap — info only)"
 
-    logger.info("🎯 Profile matching complete: %d/%d jobs flagged as good matches (threshold: %d%%)",
-                matched_count, len(jobs), MATCH_THRESHOLD)
+    logger.info("🎯 Skill scoring complete (INFO ONLY — no verdict): "
+                "%d/%d jobs above the %d%% skill-overlap label cutoff",
+                above_threshold, len(jobs), MATCH_THRESHOLD)
 
     return jobs

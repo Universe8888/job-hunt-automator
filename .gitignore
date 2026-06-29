@@ -106,3 +106,16 @@ coverage.xml
 .coverage
 .pytest_cache/
 .mypy_cache/
+
+# ──────────────────────────────────────────────
+# Local career-strategy context
+# ──────────────────────────────────────────────
+.local/
+CLAUDE.local.md
+# Brainstorming/spec docs reference the private .local strategy — keep out of the
+# public repo. (Scoped to this subtree, not all of docs/, so public docs can live
+# elsewhere under docs/ later.)
+docs/superpowers/
+debug_html/
+# Ad-hoc local validation harness (not part of the test suite).
+validate_filter_samples.py

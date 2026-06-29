@@ -3,8 +3,16 @@ LinkedIn Jobs Scraper — Stealth Browser Configuration
 Sets up Playwright with stealth patches and realistic browser fingerprinting.
 """
 
+import os
 import random
 from config import USER_AGENTS, PROXY_URL, HEADLESS_DEFAULT
+
+# Optional: launch a real, installed browser instead of Playwright's bundled
+# Chromium. Playwright's Chromium carries automation tells that anti-bot walls
+# (e.g. DataDome on jobs.bg) fingerprint; a signed Chrome/Edge build presents a
+# genuine fingerprint. Set BROWSER_CHANNEL=chrome (or msedge) to enable.
+# Empty/unset → default bundled Chromium (unchanged behaviour).
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "").strip()
 
 
 STEALTH_SCRIPT = """
@@ -69,9 +77,19 @@ def get_random_user_agent() -> str:
 def get_launch_options(headless: bool | None = None) -> dict:
     """Return Playwright browser launch options."""
     use_headless = headless if headless is not None else HEADLESS_DEFAULT
-    options = {
-        "headless": use_headless,
-        "args": [
+
+    if BROWSER_CHANNEL:
+        # Real-browser channel: keep the args list CLEAN. Flags like --no-sandbox
+        # and --disable-web-security raise a visible infobar and are detectable by
+        # anti-bot JS (DataDome), defeating the point of using a genuine browser.
+        # Only the automation-controlled toggle is kept (it hides navigator.webdriver).
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--start-maximized",
+        ]
+    else:
+        args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
             "--no-sandbox",
@@ -80,7 +98,11 @@ def get_launch_options(headless: bool | None = None) -> dict:
             "--start-maximized",
             "--disable-web-security",
             "--disable-features=IsolateOrigins,site-per-process",
-        ],
+        ]
+
+    options = {
+        "headless": use_headless,
+        "args": args,
     }
     if use_headless:
         # Use new headless mode (more stealthy)
@@ -92,6 +114,11 @@ def get_launch_options(headless: bool | None = None) -> dict:
 
     if PROXY_URL:
         options["proxy"] = {"server": PROXY_URL}
+
+    # Use a real installed browser channel (chrome/msedge) when requested —
+    # this is the strongest lever against fingerprint-based anti-bot walls.
+    if BROWSER_CHANNEL:
+        options["channel"] = BROWSER_CHANNEL
 
     return options
 

@@ -25,17 +25,24 @@ import time
 import os
 import atexit
 
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
+# NOTE: playwright / playwright_stealth are optional, heavyweight scraping
+# dependencies. They are imported lazily inside the two coroutines that
+# actually launch a browser (run_login_mode, run) so that `import main`
+# succeeds for the pure, no-I/O paths — gate evaluation, CSV routing, and
+# the BrowserSession/constant smoke tests — without the browser stack
+# installed. Do NOT promote these back to module-level imports.
 
-from config import KEYWORDS, LOCATIONS, PROFILE_PDF, OUTPUT_CSV, MAX_JOBS_PER_RUN, TARGET_SITE
+from config import KEYWORDS, LOCATIONS, PROFILE_PDF, OUTPUT_CSV, MAX_JOBS_PER_RUN, TARGET_SITE, LEADS_CSV, REJECTS_CSV
 from stealth_config import get_launch_options, get_context_options, get_random_user_agent, apply_stealth_to_page
 from scraper import human_delay
-from csv_export import export_to_csv
+from csv_export import export_to_csv, export_rejects_csv, sort_leads_csv
 from profile_matcher import match_jobs, load_skills
+
+import gatekeeper
 
 import scraper as linkedin_scraper
 import jobsbg_scraper
+from cdp_session import CDPSession, human_pace as cdp_human_pace, DEFAULT_CDP_ENDPOINT as CDP_DEFAULT_ENDPOINT
 
 try:
     from tqdm import tqdm
@@ -267,6 +274,9 @@ async def run_login_mode(headless: bool, cookies_file: str | None):
     ⚠️ WARNING: Using your profile for automated scraping carries a high risk
     of account suspension or permanent banning. Use at your own risk.
     """
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+
     async with Stealth().use_async(async_playwright()) as p:
         session = await BrowserSession(p, headless=headless).start()
         page = session.page
@@ -299,6 +309,66 @@ async def run_login_mode(headless: bool, cookies_file: str | None):
             logging.warning("⚠️  Could not save cookies: %s", str(e))
 
         await session.close()
+
+
+# ────────────────────────────────────────
+# 3-Gate Verdict Pipeline (per-job)
+# ────────────────────────────────────────
+
+def _attach_verdict(job: dict) -> str:
+    """
+    Run the 3-gate filter on a single job and attach the Verdict fields onto the
+    job dict (per the interface contract §4.3) so the CSV writers can read them.
+
+    The legacy skill score (already on job via match_jobs) is INFO-ONLY — the
+    three gates decide the verdict, not the score.
+
+    Attaches:
+        job['verdict']           "keep" | "manual_review" | "reject"
+        job['rank']              float
+        job['gate1_status'] / ['gate2_status'] / ['gate3_status']   gate statuses
+        job['gate_reasons']      "; "-joined list of all gate reasons
+        job['parsed_comp_eur']   normalized EUR/yr gross figure, or "" if undisclosed
+
+    Returns the verdict string.
+    """
+    verdict = gatekeeper.evaluate(job)
+
+    job["verdict"] = verdict.verdict
+    job["rank"] = round(verdict.rank, 4)
+    job["gate1_status"] = verdict.gate1.status
+    job["gate2_status"] = verdict.gate2.status
+    job["gate3_status"] = verdict.gate3.status
+    job["gate_reasons"] = "; ".join(verdict.reasons)
+
+    # Surface the normalized comp number for the CSV column. evaluate() re-parses
+    # internally but does not expose the figure, so re-run the pure parser over
+    # the same combined text (title + description + salary).
+    comp_text = "\n".join(
+        filter(None, [job.get("title", ""), job.get("description", ""), job.get("salary", "")])
+    )
+    parsed = gatekeeper.parse_comp(comp_text)
+    job["parsed_comp_eur"] = round(parsed.top_eur_gross_yr) if parsed else ""
+
+    return verdict.verdict
+
+
+def _route_job(job: dict, leads_csv: str, rejects_csv: str) -> tuple[str, int]:
+    """
+    Route a fully-evaluated job to the correct CSV (real-time saving):
+      verdict in {keep, manual_review} -> leads CSV  (export_to_csv)
+      verdict == reject                -> rejects CSV (export_rejects_csv)
+
+    Returns (verdict, new_row_count) where new_row_count is 0 for a duplicate.
+    """
+    verdict = job.get("verdict", "")
+    if verdict == "reject":
+        new_count = export_rejects_csv([job], rejects_csv)
+    else:
+        # Incremental save: skip the per-row rank sort (O(n^2) over a run); the
+        # leads CSV is sorted once at the end of the run via sort_leads_csv().
+        new_count = export_to_csv([job], leads_csv, sort_after=False)
+    return verdict, new_count
 
 
 # ────────────────────────────────────────
@@ -338,15 +408,22 @@ async def run(args):
         logger.warning("   Forcing non-headless mode...")
         headless = False
 
+    # Two-file model (user decision #2): leads (keep + manual_review) and a
+    # SEPARATE rejects audit CSV (reject) — nothing is silently dropped.
+    active_scraper = jobsbg_scraper if selected_site == "jobs.bg" else linkedin_scraper
+    is_jobsbg = selected_site == "jobs.bg"
+
     if getattr(args, "output", None):
-        output_csv = args.output
-        active_scraper = jobsbg_scraper if selected_site == "jobs.bg" else linkedin_scraper
-    elif selected_site == "jobs.bg":
-        active_scraper = jobsbg_scraper
-        output_csv = "Jobs.bg-leads.csv"
+        # --output overrides the LEADS path; the rejects path is derived by suffix.
+        leads_csv = args.output
+        _root, _ext = os.path.splitext(leads_csv)
+        rejects_csv = _root + "-rejects" + (_ext or ".csv")
+    elif is_jobsbg:
+        leads_csv = "Jobs.bg-leads.csv"
+        rejects_csv = "Jobs.bg-rejects.csv"
     else:
-        active_scraper = linkedin_scraper
-        output_csv = OUTPUT_CSV
+        leads_csv = LEADS_CSV
+        rejects_csv = REJECTS_CSV
 
     # Load cookies for authenticated session
     cookies_file = getattr(args, "cookies", None) or COOKIES_FILE
@@ -368,7 +445,8 @@ async def run(args):
     logger.info("   Fetch descriptions: %s (Real-Time)", fetch_descriptions)
     logger.info("   Target Site: %s", selected_site)
     logger.info("   Profile PDF: %s", profile_pdf)
-    logger.info("   Output: %s", output_csv)
+    logger.info("   Leads CSV (keep + manual_review):   %s", leads_csv)
+    logger.info("   Rejects CSV (reject — audit trail): %s", rejects_csv)
     logger.info("   Total search combinations: %d", total_combinations)
     logger.info("   Headless: %s", headless)
     logger.info("   Auth: %s", auth_status)
@@ -388,18 +466,30 @@ async def run(args):
     hit_max = False
 
     # Launch browser with stealth
-    async with Stealth().use_async(async_playwright()) as p:
-        session = await BrowserSession(p, headless=headless, cookies=cookies).start()
-        page = session.page
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
 
-        # Warm up: visit target site homepage first (looks more natural)
-        home_url = "https://www.linkedin.com/" if selected_site == "linkedin" else "https://www.jobs.bg/en/"
-        logger.info("🏠 Warming up — visiting %s homepage…", selected_site)
-        try:
-            await page.goto(home_url, wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(3)
-        except Exception as e:
-            logger.warning("⚠️  Homepage warm-up failed: %s", str(e)[:100])
+    use_cdp = getattr(args, "cdp", False)
+
+    async with Stealth().use_async(async_playwright()) as p:
+        if use_cdp:
+            # Attach to a running, human-cleared browser (DataDome bypass). No warm-up:
+            # the session is already on jobs.bg and past the challenge.
+            session = await CDPSession(p, endpoint=getattr(args, "cdp_endpoint", CDP_DEFAULT_ENDPOINT)).start()
+            page = session.page
+            logger.info("🔌 CDP mode — scraping through your cleared browser session.")
+        else:
+            session = await BrowserSession(p, headless=headless, cookies=cookies).start()
+            page = session.page
+
+            # Warm up: visit target site homepage first (looks more natural)
+            home_url = "https://www.linkedin.com/" if selected_site == "linkedin" else "https://www.jobs.bg/en/"
+            logger.info("🏠 Warming up — visiting %s homepage…", selected_site)
+            try:
+                await page.goto(home_url, wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.warning("⚠️  Homepage warm-up failed: %s", str(e)[:100])
 
         # Iterate searches
         combo_num = 0
@@ -460,22 +550,45 @@ async def run(args):
 
                         if fetch_descriptions and job.get("url"):
                             t0 = time.time()
-                            job["description"] = await active_scraper.fetch_job_description(page, job["url"])
-                            desc_time += time.time() - t0
-                            await human_delay(2, 5)
-                        else:
-                            job["description"] = ""
-
-                        # Match and save immediately (Real-Time Saving)
-                        matched_job = match_jobs([job], skills=skills)[0]
-                        new_count = export_to_csv([matched_job], output_csv)
-
-                        all_jobs.append(matched_job)
-                        if not HAS_TQDM:
-                            if new_count > 0:
-                                logger.info("      ✅ Saved to %s", output_csv)
+                            if is_jobsbg:
+                                # jobs.bg fetcher also fills job['location'] from the
+                                # detail-page DOM when blank (USER DECISION #3 — feeds
+                                # Gate 2 geo). LinkedIn's fetcher takes only (page, url).
+                                job["description"] = await active_scraper.fetch_job_description(
+                                    page, job["url"], job
+                                )
                             else:
-                                logger.info("      📎 Duplicate skipped")
+                                job["description"] = await active_scraper.fetch_job_description(
+                                    page, job["url"]
+                                )
+                            desc_time += time.time() - t0
+                            # CDP mode rides a human-cleared DataDome session; pace
+                            # like a human to avoid a re-challenge. Other modes keep
+                            # the original fast cadence.
+                            if use_cdp:
+                                await cdp_human_pace(i)
+                            else:
+                                await human_delay(2, 5)
+                        else:
+                            job.setdefault("description", "")
+
+                        # 1) INFO scoring (legacy skill match — never gates).
+                        match_jobs([job], skills=skills)
+
+                        # 2) 3-gate verdict — attaches verdict/rank/gate fields.
+                        _attach_verdict(job)
+
+                        # 3) Route + save immediately (Real-Time Saving):
+                        #    keep|manual_review -> leads; reject -> rejects audit CSV.
+                        verdict, new_count = _route_job(job, leads_csv, rejects_csv)
+
+                        all_jobs.append(job)
+                        if not HAS_TQDM:
+                            dest = rejects_csv if verdict == "reject" else leads_csv
+                            if new_count > 0:
+                                logger.info("      → %s | saved to %s", verdict, dest)
+                            else:
+                                logger.info("      → %s | 📎 duplicate skipped", verdict)
 
                     # Close tqdm bar if used
                     if HAS_TQDM and hasattr(job_iter, 'close'):
@@ -500,32 +613,55 @@ async def run(args):
         logger.warning("⚠️  No jobs were found in this run.")
         return
 
-    # Print summary
+    # Single final rank sort (rows were written with sort_after=False to avoid an
+    # O(n^2) per-row rewrite during incremental saving).
+    sort_leads_csv(leads_csv)
+
+    # ── Verdict-based summary (the 3 gates decide the verdict, not the score) ──
+    keeps = [j for j in all_jobs if j.get("verdict") == "keep"]
+    reviews = [j for j in all_jobs if j.get("verdict") == "manual_review"]
+    rejects = [j for j in all_jobs if j.get("verdict") == "reject"]
+
     logger.info("")
     logger.info("═" * 60)
-    logger.info("  MATCH SUMMARY")
+    logger.info("  VERDICT SUMMARY")
     logger.info("═" * 60)
-    logger.info("  Output file:          %s", output_csv)
+    logger.info("  ✅ keep:           %d", len(keeps))
+    logger.info("  🔍 manual_review:  %d", len(reviews))
+    logger.info("  ❌ reject:         %d", len(rejects))
+    logger.info("")
+    logger.info("  Leads CSV   (keep + manual_review): %s", leads_csv)
+    logger.info("  Rejects CSV (audit trail):          %s", rejects_csv)
 
-    # Show top matches across the whole run
-    matched = [j for j in all_jobs if j.get("match_score", 0) >= 35]
-
-    if matched:
-        matched.sort(key=lambda j: j.get("match_score", 0), reverse=True)
+    # Top leads by rank (leads CSV is already sorted by Rank desc on write).
+    leads = keeps + reviews
+    if leads:
+        leads.sort(key=lambda j: j.get("rank", 0.0), reverse=True)
         logger.info("")
-        logger.info("🏆 Top Matches (score ≥ %d%%):", 35)
-        for i, job in enumerate(matched[:10], 1):
-            skills_preview = ", ".join(job.get("matched_skills", [])[:5])
-            logger.info("  %d. [%.0f%%] %s @ %s",
-                        i, job["match_score"], job.get("title", "?"), job.get("company", "?"))
-            if skills_preview:
-                logger.info("      Skills: %s", skills_preview)
+        logger.info("🏆 Top leads by rank:")
+        for i, job in enumerate(leads[:10], 1):
+            comp = job.get("parsed_comp_eur", "")
+            comp_str = f"~€{comp:,}/yr" if isinstance(comp, (int, float)) else "comp undisclosed"
+            logger.info(
+                "  %d. [rank %.2f | %s] %s @ %s (%s)",
+                i,
+                job.get("rank", 0.0),
+                job.get("verdict", "?"),
+                job.get("title", "?"),
+                job.get("company", "?"),
+                comp_str,
+            )
+            logger.info("      gates: lane=%s geo=%s ceiling=%s",
+                        job.get("gate1_status", "?"),
+                        job.get("gate2_status", "?"),
+                        job.get("gate3_status", "?"))
             logger.info("      %s", job.get("url", ""))
     else:
-        logger.info("  No jobs exceeded the match threshold.")
+        logger.info("")
+        logger.info("  No leads passed the 3-gate filter — all postings were rejected.")
 
     logger.info("")
-    logger.info("✅ Done! Open %s to review your leads.", output_csv)
+    logger.info("✅ Done! Open %s to review your leads (sorted by rank).", leads_csv)
 
 
 # ────────────────────────────────────────
@@ -573,6 +709,13 @@ Examples:
                              "⚠️ USE AT YOUR OWN RISK: May lead to account suspension/ban.")
     parser.add_argument("--cookies", type=str,
                         help="Path to a JSON cookie file for authenticated scraping")
+    parser.add_argument("--cdp", action="store_true",
+                        help="Attach to a running browser over CDP (default %s) instead of "
+                             "launching one. Use for jobs.bg: open your real browser with "
+                             "--remote-debugging-port=9222, solve DataDome once, then scrape "
+                             "through that cleared session." % CDP_DEFAULT_ENDPOINT)
+    parser.add_argument("--cdp-endpoint", type=str, default=CDP_DEFAULT_ENDPOINT,
+                        help="CDP endpoint to attach to (default: %(default)s)")
 
     args = parser.parse_args()
     asyncio.run(run(args))

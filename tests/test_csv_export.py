@@ -270,4 +270,8 @@ class TestCsvColumns:
             assert col in CSV_COLUMNS
 
     def test_column_count(self):
-        assert len(CSV_COLUMNS) == 12
+        # The 3-gate rebuild extended the legacy CSV_COLUMNS alias with
+        # Seniority / Employment Type / Applicants (12 -> 15). The original 12
+        # names are still asserted present by test_all_expected_columns_present;
+        # the live exporters use the 22-col LEADS_COLUMNS / REJECTS_COLUMNS.
+        assert len(CSV_COLUMNS) == 15

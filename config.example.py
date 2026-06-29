@@ -92,6 +92,18 @@ SIGN_IN_MODAL_WAIT = 5            # seconds to wait before dismissing modal
 MAX_RETRIES_ON_BLOCK = 3          # max retries before skipping a search term
 
 # ──────────────────────────────────────────────
+# CDP-mode human pacing (jobs.bg / DataDome)
+# Sustained machine-speed fetches re-trigger DataDome even in a human-cleared
+# session ("browsing faster than a normal user"). In --cdp mode we pace each
+# detail fetch with a longer, randomized delay and an occasional "reading" pause.
+# ──────────────────────────────────────────────
+CDP_MIN_DELAY = 12.0              # min seconds between detail fetches in CDP mode
+CDP_MAX_DELAY = 30.0              # max seconds between detail fetches in CDP mode
+CDP_LONG_PAUSE_EVERY = 7          # every Nth job, take a longer "reading" pause
+CDP_LONG_PAUSE_MIN = 45.0         # min seconds for the periodic long pause
+CDP_LONG_PAUSE_MAX = 90.0         # max seconds for the periodic long pause
+
+# ──────────────────────────────────────────────
 # Sign-in modal text markers (content validation)
 # If a scraped description contains any of these,
 # it's modal garbage — discard it.
@@ -171,4 +183,241 @@ SKILL_WEIGHTS = {
 }
 
 # Match score threshold (0–100) — jobs scoring above this are "Good Match"
+# NOTE (v3.2 / 3-gate rebuild): the skill score below is now INFO-ONLY.
+# It is surfaced as CSV columns (Match Score / Matched Skills / Match Flag)
+# but NO LONGER decides any verdict. The 3 gates in gatekeeper.py decide
+# keep / manual_review / reject. (User decision #1.)
 MATCH_THRESHOLD = 35
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3-GATE FILTER — gatekeeper.py constants  (v3.2 rebuild, 2026-06-29)
+# ══════════════════════════════════════════════════════════════════════════
+# These constants are IMPORTED by gatekeeper.py (never re-typed elsewhere).
+# The scraper is a FILTER: every posting passes lane × geo × ceiling.
+#   - keep + manual_review  -> leads CSV  (LEADS_CSV)
+#   - reject                -> rejects audit CSV  (REJECTS_CSV)  [never silently dropped]
+# Word-boundary, case-insensitive matching reuses profile_matcher.score_job's
+# \b<term>\b idiom. Multi-word phrases are stored lowercased + single-spaced.
+# See docs/superpowers/specs/2026-06-29-3gate-filter-rebuild-design.md
+# ══════════════════════════════════════════════════════════════════════════
+
+# ──────────────────────────────────────────────
+# GATE 1 — LANE  (AI-Governance hybrid: governs AND builds AI)
+# ──────────────────────────────────────────────
+# LANE_ALLOW: ≥1 distinct match in title+body -> Gate 1 passes (lane_hits>=1).
+# lane_hits = count of DISTINCT terms present (presence, not frequency).
+# Synonyms / spelling variants are SEPARATE entries so any one counts as a hit.
+# Group comments are for traceability only; the runtime list is flat.
+LANE_ALLOW = [
+    # AI governance core
+    "ai governance", "ai risk", "ai risk management", "responsible ai",
+    "ai policy", "ai compliance", "model governance", "model risk",
+    # AI tool inventory / shadow AI
+    "ai tool inventory", "ai inventory", "shadow ai", "shadow it", "ai discovery",
+    # GRC / compliance automation
+    "grc", "compliance automation", "governance risk and compliance",
+    "risk and compliance", "controls automation",
+    # Standards (KEEP THE HEDGE: iso 27001-style)
+    "soc2", "soc 2", "iso 27001", "iso27001", "iso 27001-style",
+    "nist", "control framework", "security controls",
+    # Audit evidence / remediation
+    "audit evidence", "evidence chain", "evidence collection",
+    "remediation tracking", "remediation", "audit readiness",
+    # Asset / SaaS governance
+    "software asset management", "sam", "saas governance", "saas management",
+    "application inventory", "asset inventory", "itam", "it asset management",
+    # Agentic AI / tooling
+    "agentic ai", "agentic", "mcp", "model context protocol",
+    "agent tooling", "ai agents", "ai agent", "tool calling",
+    # RAG / eval / observability
+    "rag", "agentic rag", "retrieval augmented generation",
+    "llm eval", "evals", "eval", "evaluation harness",
+    "observability", "llm observability",
+    # Automation / platform engineering
+    "automation", "python automation", "enterprise automation",
+    "fastapi", "playwright", "python",
+    # Customer-facing technical lane
+    "solutions engineer", "solution engineer",
+    "forward deployed engineer", "forward-deployed engineer", "fde",
+    # Regulatory lane
+    "eu ai act", "ai act",
+]
+
+# WEAK lane terms: broad words that ALSO appear in generic operator roles, so a
+# match on these ALONE is not a confident lane signal. Live jobs.bg data showed
+# "Data Engineer" / "Monday.com Specialist" passing Gate 1 on just "python" or
+# "automation". Rule: a PASS needs >=1 STRONG lane term (a LANE_ALLOW term NOT in
+# this list) OR >=2 WEAK terms; a lone weak hit -> manual_review (never a clean
+# pass, never a reject). Keep this a SUBSET of LANE_ALLOW.
+LANE_ALLOW_WEAK = [
+    "python", "automation", "observability", "eval", "evals",
+    "remediation", "agentic", "sam", "solutions engineer", "solution engineer",
+]
+
+# LANE_DENY: operator-lane BODY signals. PENALTY ONLY — each distinct hit
+# subtracts DENY_PENALTY from lane_hits (floored at 0.0). NEVER flips
+# pass -> hard_fail on its own (per contract). QUALIFIED/disambiguated forms
+# so an in-lane JD that merely mentions a word in passing isn't penalized.
+LANE_DENY = [
+    "generic business analyst", "requirements-only ba",
+    "requirements gathering only",
+    "l1 support", "level 1 support", "first-line support",
+    "helpdesk", "help desk", "service desk agent",
+    "desktop support", "deskside support",
+    "pos support", "point of sale support", "cash register", "till support",
+    "sysadmin", "system administrator", "server administration",
+    "network administrator", "field technician", "field engineer",
+    "inventory specialist", "stock controller", "warehouse",
+    "data entry", "logistics coordinator", "procurement clerk",
+    "junior developer", "junior js developer", "generic backend developer",
+    "branch systems", "store systems", "retail systems support",
+]
+
+# DENY_PENALTY: subtracted from lane_hits per distinct LANE_DENY body hit
+# (de-rank only; never flips the verdict). Tunable; sits with RANK_WEIGHTS.
+DENY_PENALTY = 0.5
+
+# TITLE_HARD_DENY: UNAMBIGUOUS operator TITLES only -> immediate Gate 1
+# hard_fail (matched against the TITLE only, word-boundary phrase).
+# FIX #1: contains the QUALIFIED BA form ("generic business analyst",
+# "requirements-only ba") and DELIBERATELY OMITS bare "business analyst" —
+# a "Business Analyst, AI Governance" must survive on body keywords.
+TITLE_HARD_DENY = [
+    "inventory specialist", "stock controller",
+    "warehouse associate", "warehouse operative", "warehouse manager",
+    "pos support", "point of sale support", "cashier", "till operator",
+    "helpdesk technician", "help desk technician", "service desk agent",
+    "desktop support technician", "deskside support",
+    "field technician", "field service technician",
+    "data entry clerk", "data entry operator",
+    "procurement clerk", "logistics coordinator",
+    "store systems technician",
+    # FIX #1: the QUALIFIED BA form ONLY — never bare "business analyst"
+    "generic business analyst", "requirements-only ba",
+]
+
+# ──────────────────────────────────────────────
+# GATE 2 — GEO  (stay BG-taxed while reaching a Western payer)
+# ──────────────────────────────────────────────
+# Precedence inside the gate: DENY > ALLOW > SOFT > unknown.
+# Matched on a normalized haystack = location + title + description.
+# Multi-word phrases -> substring; bare ambiguous tokens -> word-boundary.
+#
+# LOCATION_ALLOW: clean pass, geo_certainty 1.0.
+# CAVEAT: a BARE BG city (sofia/plovdiv/...) is NOT an automatic clean allow —
+# a local-Sofia on-site role is dead. BG city alone -> demoted to SOFT by the
+# gate's bg_city_without_remote() check; BG city + remote/EOR -> clean pass.
+LOCATION_ALLOW = [
+    # remote (global / anywhere)
+    "remote", "fully remote", "100% remote", "remote-first", "remote first",
+    "work from anywhere", "anywhere in the world",
+    "remote (global)", "remote - global", "global remote",
+    # remote (EMEA / EU / Europe)
+    "remote (emea)", "remote emea", "emea remote",
+    "remote (eu)", "remote eu", "eu remote",
+    "remote (europe)", "remote europe", "europe remote",
+    "remote within europe", "anywhere in europe", "anywhere in emea",
+    "anywhere in the eu",
+    # Bulgaria / BG cities (allow only when paired with a remote/EOR signal —
+    # the gate demotes bare-BG-city to SOFT)
+    "bulgaria", "bulgarian", "sofia", "plovdiv", "varna", "burgas",
+    # EOR / contractor-of-record into BG
+    "employer of record", "eor", "hired via deel", "via deel", "deel",
+    "remote.com", "hired through remote.com", "contractor of record",
+    "we can hire you in bulgaria", "we hire in bulgaria",
+    "eligible to work in bulgaria",
+]
+
+# LOCATION_DENY: hard_fail, geo_certainty 0.0. DENY ALWAYS WINS.
+# Western-hub rule (mirrors Gate 1 FIX #1): a BARE hub city ("London") is NOT
+# a deny ("Remote (EMEA), HQ in London" must keep). Deny fires only on the
+# QUALIFIED hub phrase (based in / relocation to / on-site in <hub>).
+LOCATION_DENY = [
+    # forced relocation
+    "relocation required", "relocation is required", "must relocate",
+    "willing to relocate", "required to relocate",
+    "relocation package", "relocation assistance", "relocation support",
+    "candidate must move",
+    # on-site only
+    "on-site presence required in", "on-site only", "onsite only",
+    "fully on-site", "fully onsite", "100% on-site", "100% onsite",
+    "office-based", "office based", "in-office", "in office daily",
+    "5 days in office", "5 days a week in the office",
+    "no remote", "remote not available", "remote is not possible",
+    # US-only / region-locked
+    "remote (us)", "remote us only", "us-remote", "us remote",
+    "remote within the us", "remote within us", "remote (united states)",
+    "must be based in the us", "must reside in the united states",
+    "us-based only", "authorized to work in the us", "us work authorization",
+    "namer only", "north america only", "us & canada only",
+    "us and canada only", "americas only",
+    "apac only", "apac-based", "must be based in apac", "latam only",
+    # forced Western-hub relocation (qualified phrases only — bare city is NOT deny)
+    "relocation to london", "relocation to dublin", "relocation to zurich",
+    "relocation to zürich", "relocation to brussels", "relocation to munich",
+    "relocation to münchen", "relocation to paris", "relocation to madrid",
+    "relocation to amsterdam",
+    "based in london", "based in dublin", "based in zurich", "based in zürich",
+    "based in brussels", "based in munich", "based in paris",
+    "based in madrid", "based in amsterdam",
+    "on-site in london", "on-site in dublin", "on-site in munich",
+    "on-site in paris", "on-site in amsterdam",
+]
+
+# LOCATION_SOFT: manual_review, geo_certainty 0.5 (FIX #2 — never blanket deny).
+# hybrid-EMEA-EOR-eligible = good; hybrid-local-Sofia = dead — only a human
+# can tell, so soft. remote (worldwide)/(international) live HERE not in ALLOW
+# because some hide a "must be US tax-resident" clause; a clean EMEA/EU/BG
+# allow elsewhere upgrades to pass via precedence.
+LOCATION_SOFT = [
+    "hybrid", "hybrid working", "hybrid work", "hybrid model",
+    "hybrid remote", "partially remote",
+    "remote-friendly", "remote friendly",
+    "flexible location", "flexible work location",
+    "occasional travel to office", "days in the office per week",
+    "international contractor", "contractor", "freelance",
+    "b2b contract", "self-employed contract",
+    "global team", "distributed team", "work across time zones",
+    "european time zone", "cet time zone", "cet hours",
+    "remote (worldwide)", "remote (international)",
+]
+
+# ──────────────────────────────────────────────
+# GATE 3 — CEILING  (can disclosed comp clear the €137.5k gross goal?)
+# ──────────────────────────────────────────────
+# Bands on the normalized figure T = top_eur_gross_yr (EUR / yr / GROSS):
+#   T <= 72000          -> hard_fail (top of BG IT-ops band)
+#   72000 < T < 120000  -> pass + "below floor"      (nets < €10k/mo)
+#   120000 <= T < 137500-> pass + "capable but short"
+#   T >= 137500         -> pass (clean — meets goal)
+SALARY_GOAL_EUR              = 137500   # gross/yr -> ~€10,050/mo net ✅
+SALARY_FLOOR_EUR             = 120000   # gross/yr -> ~€8,740/mo net (below €10k net target)
+SALARY_AUTO_REJECT_BELOW_EUR = 72000    # top of BG IT-ops band; disclosed <= this -> hard_fail
+DISCLOSED_COMP_REQUIRED      = False     # FIX #3: undisclosed -> manual_review, NOT hard reject
+
+# FX_RATES: convert detected currency to EUR. BGN is pegged to EUR at 1.95583
+# (expressed as multiply-by-reciprocal). USD/GBP are STATIC approximations —
+# rates as of 2026-06, update periodically.
+FX_RATES = {
+    "EUR": 1.0,
+    "BGN": 1.0 / 1.95583,   # BGN pegged to EUR at 1.95583 (lev)
+    "USD": 0.92,            # static approximation — update periodically
+    "GBP": 1.17,            # static approximation — update periodically
+}
+
+# NET_TO_GROSS_FACTOR: when a NET figure is detected, multiply by this to
+# estimate gross-equivalent (derived from the €120k-net <-> €137.5k-gross anchor).
+NET_TO_GROSS_FACTOR = 1.146
+
+# ──────────────────────────────────────────────
+# RANK  (apply-first sorts on top)
+# ──────────────────────────────────────────────
+# rank = w_lane*lane_hits + w_geo*geo_certainty + w_comp*comp_headroom
+RANK_WEIGHTS = {"w_lane": 1.0, "w_geo": 1.0, "w_comp": 1.0}  # tune later
+
+# ──────────────────────────────────────────────
+# Output CSVs (3-gate rebuild — two destinations, nothing silently dropped)
+# ──────────────────────────────────────────────
+LEADS_CSV   = "leads.csv"     # keep + manual_review
+REJECTS_CSV = "rejects.csv"   # hard-reject audit trail

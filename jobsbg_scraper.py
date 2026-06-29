@@ -22,6 +22,53 @@ RESULTS_PER_PAGE = 15
 
 DEBUG_HTML_DIR = "debug_html"
 
+# Detail-page DOM selectors for structured location extraction (USER DECISION #3).
+# Ordered most-specific -> most-general; first plausible non-empty hit wins.
+# Each is guarded by count() > 0 and read via inner_text(). Derived defensively from
+# the known card DOM (mdc-card, secondary-text) and the job-view containers already
+# read by fetch_job_description; confirm/adjust against a real detail page captured
+# via _dump_debug_html(). The gate's body keyword scan is the safety net if all miss.
+GEO_DETAIL_SELECTORS = [
+    # 1. Explicit location anchor (jobs.bg links location to a town search)
+    "a[href*='location_sid']",
+    "a[href*='towns']",
+    # 2. Structured info rows in the left/header column
+    ".job-view-location",
+    ".mdc-card .location",
+    "#jobView .location",
+    "span.location",
+    # 3. Labelled info row: a secondary-text node carrying the place
+    ".job-view-left-column .secondary-text",
+    "#jobViewContent .secondary-text",
+    # 4. The address / map block jobs.bg renders for office roles
+    ".job-view-address",
+    "[itemprop='jobLocation']",
+    "[itemprop='addressLocality']",
+]
+
+
+# Precompiled once (looks_like_sentence is called per-selector in a loop).
+_SENTENCE_MIDDLE = re.compile(r"[.!?]\s+[A-ZА-Я]")
+_SENTENCE_END = re.compile(r"[.!?]$")
+
+
+def looks_like_sentence(text: str) -> bool:
+    """Reject description paragraphs masquerading as a location string.
+
+    Returns True when the text reads like prose rather than a short place
+    label: more than 8 words, or sentence punctuation (a period/!/? followed
+    by a space and a capital letter, or a trailing terminal punctuation mark).
+    """
+    if not text:
+        return False
+    if len(text.split()) > 8:
+        return True
+    if _SENTENCE_MIDDLE.search(text):
+        return True
+    if _SENTENCE_END.search(text.strip()):
+        return True
+    return False
+
 
 def build_jobsbg_search_url(keyword: str, location: dict, offset: int = 0) -> str:
     """Build the Jobs.bg search results URL."""
@@ -96,28 +143,75 @@ def parse_jobsbg_cards(html: str) -> list[dict]:
     return jobs
 
 
+# Markers that identify an anti-bot interstitial. jobs.bg fronts with DataDome,
+# which serves TWO block variants: the interactive "Just a moment…"/"Проверка"
+# challenge (detectable by title) AND a static JS-gate page whose <title> is the
+# innocuous "jobs.bg" — that one is only detectable by body content. We check both.
+BLOCK_TITLE_MARKERS = ("Just a moment", "Проверка")
+BLOCK_CONTENT_MARKERS = (
+    "captcha-delivery.com",          # DataDome challenge host
+    "geo.captcha-delivery.com",
+    "Please enable JS",              # static JS-gate block page text
+    'id="cmsg"',                     # the block page's message element
+    "disable any ad blocker",
+)
+
+# How long to give the user to solve a challenge by hand (seconds).
+CAPTCHA_SOLVE_TIMEOUT = 120
+
+
+# A genuine DataDome block page is tiny (~1.5 KB) and carries no real content.
+# A successfully-loaded jobs.bg page can STILL contain a "captcha-delivery.com"
+# script reference (DataDome's client JS rides along on cleared pages), so a bare
+# marker match is a false positive. Treat a page as blocked only when a marker is
+# present AND there is no real content (no job cards, tiny body).
+_BLOCK_MAX_CONTENT_LEN = 20000  # real list/detail pages are 80KB–450KB
+
+
 async def _is_blocked_page(page) -> bool:
-    """No captcha checking — always returns False."""
-    return False
+    """True only if the page is an actual DataDome block — marker present AND no
+    real content. The interactive challenge (title "Just a moment…") is always a
+    block; the static JS-gate is a block only when no job content rendered."""
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+    # The interactive challenge title is unambiguous — always a block.
+    if any(m in title for m in BLOCK_TITLE_MARKERS):
+        return True
+    try:
+        html = await page.content()
+    except Exception:
+        return False
+    if not any(m in html for m in BLOCK_CONTENT_MARKERS):
+        return False
+    # Marker present: confirm it's a real block, not just lingering DataDome JS on
+    # a page that actually loaded. Real content (job cards or a large body) clears it.
+    has_cards = "mdc-card" in html
+    looks_substantial = len(html) > _BLOCK_MAX_CONTENT_LEN
+    return not (has_cards or looks_substantial)
 
 
 async def _wait_for_captcha(page) -> bool:
-    """Wait for user to solve captcha. Returns True if solved."""
-    title = await page.title()
-    if "Just a moment" not in title and "Проверка" not in title:
+    """If the page is blocked, pause for the user to solve it in the visible window.
+
+    Detects BOTH the title-based challenge and the static JS-gate block page
+    (title "jobs.bg" + DataDome content markers). Returns True once the block
+    clears, False on timeout.
+    """
+    if not await _is_blocked_page(page):
         return True
 
-    logger.warning("  ⚠️  DETECTED JOBS.BG CAPTCHA!")
-    logger.warning("  ⚠️  Please solve the captcha in the browser window within 60 seconds...")
-    for _ in range(30):
+    logger.warning("  🛑 JOBS.BG ANTI-BOT BLOCK DETECTED (DataDome).")
+    logger.warning("  👉 Solve the challenge in the browser window. Waiting up to %ds…", CAPTCHA_SOLVE_TIMEOUT)
+    for _ in range(CAPTCHA_SOLVE_TIMEOUT // 2):
         await asyncio.sleep(2)
-        title = await page.title()
-        if "Just a moment" not in title and "Проверка" not in title:
-            logger.info("  ✅ Captcha successfully solved! Resuming scrape...")
+        if not await _is_blocked_page(page):
+            logger.info("  ✅ Block cleared! Resuming scrape…")
             await human_delay(2, 4)
             return True
 
-    logger.error("  ❌ Captcha not solved within 60 seconds.")
+    logger.error("  ❌ Block not cleared within %ds — skipping this search.", CAPTCHA_SOLVE_TIMEOUT)
     return False
 
 
@@ -243,8 +337,38 @@ async def scrape_jobs(page, keyword: str, location: dict,
     return all_jobs
 
 
-async def fetch_job_description(page, job_url: str) -> str:
-    """Navigate to a jobs.bg job detail page and extract the full description."""
+async def _extract_detail_location(page, job_url: str) -> str:
+    """Pull a structured location string from the jobs.bg detail-page DOM.
+
+    Loops GEO_DETAIL_SELECTORS (first plausible hit wins); each guarded by
+    count() > 0 and read via inner_text(). Accepts only short, non-prose
+    strings (<= 60 chars, not looks_like_sentence) so a description paragraph
+    is never mistaken for a location. Returns "" if nothing usable is found,
+    in which case the gate falls back to its body keyword scan -> soft.
+    """
+    for sel in GEO_DETAIL_SELECTORS:
+        try:
+            el = page.locator(sel)
+            if await el.count() > 0:
+                t = (await el.first.inner_text()).strip()
+                if t and len(t) <= 60 and not looks_like_sentence(t):
+                    return t
+        except Exception:
+            logger.debug("  ⚠️  Geo selector %s failed on %s", sel, job_url[:60])
+    return ""
+
+
+async def fetch_job_description(page, job_url: str, job: dict | None = None) -> str:
+    """Navigate to a jobs.bg job detail page and extract the full description.
+
+    USER DECISION #3 (non-breaking, Option B): if a ``job`` dict is supplied and
+    it has no location yet, attach a structured location pulled from the
+    detail-page DOM (job['location']). The return type stays ``str`` (the
+    description) so this scraper remains identically signatured with the
+    LinkedIn fetcher; the optional ``job`` mutation is the only added behavior.
+    The ``not job.get('location')`` guard means we only fill a blank — a
+    location already set by a card parser (LinkedIn) is never clobbered.
+    """
     try:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=15000)
         await human_delay(1.5, 3)
@@ -271,6 +395,14 @@ async def fetch_job_description(page, job_url: str) -> str:
                         text_blocks.append(f_text.strip())
                 except Exception:
                     logger.debug("  ⚠️  Could not extract text from iframe on %s", job_url[:60])
+
+        # USER DECISION #3 — structured location from the detail-page DOM.
+        # Only fill a blank location; never clobber a value the caller already set.
+        if job is not None and not job.get("location"):
+            location_text = await _extract_detail_location(page, job_url)
+            if location_text:
+                job["location"] = location_text
+                logger.debug("  📍 jobs.bg detail location: %s", location_text)
 
         final_text = "\n\n".join(text_blocks)
         if final_text:
