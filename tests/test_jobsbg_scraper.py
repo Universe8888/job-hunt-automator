@@ -250,3 +250,53 @@ class TestClassifyLocationSpans:
         """A company-name span without the 'Jobs of' prefix but carrying an entity
         suffix (EOOD/ЕООД/ЕАД) is still not a location."""
         assert classify_location_spans(["Festo Bulgaria EOOD"]) == ""
+
+    # --- Adversarial stress-test findings (60-case workflow, 2026-06-30) ---------
+    # 6 false-positive classes the hand-picked tests missed. All return a non-location
+    # as a location, polluting job['location']; "" is the safe outcome (body-scan
+    # fallback). Each case below is a verbatim span the stress test surfaced.
+
+    def test_entity_token_midstring_or_leading_skipped(self):
+        """BUG 1/3: a legal-entity token NOT at end-of-string (mid or leading) must
+        still mark the span a company, not a town. The old suffix regex only
+        anchored to '$', so these leaked through on their embedded town token."""
+        for span in [
+            "Akkodis Bulgaria EOOD - Sofia office",  # EOOD mid-string
+            "Adastra Bulgaria EOOD Sofia",           # EOOD mid-string
+            "ЕАД Русе",                              # ЕАД leading
+            "Ad Astra Bulgaria",                     # 'Ad' leading entity token
+        ]:
+            assert classify_location_spans([span]) == "", f"company not skipped: {span!r}"
+
+    def test_gmbh_suffix_skipped(self):
+        """BUG 2: 'GmbH' is a company suffix and must be skipped, not read as a
+        Varna location."""
+        assert classify_location_spans(["Varna Software GmbH"]) == ""
+
+    def test_negated_remote_is_not_a_remote_location(self):
+        """BUG 4: 'No remote work — strictly on-site' negates remote and states
+        on-site; it must NOT be classified as a remote work location."""
+        assert classify_location_spans(["No remote work — strictly on-site"]) == ""
+
+    def test_negation_does_not_kill_a_real_town(self):
+        """BUG 4 guard: the negation check blocks only the REMOTE branch — a short
+        span naming a real town with a remote caveat is still a (town) location."""
+        assert classify_location_spans(["Sofia (no remote)"]) == "Sofia (no remote)"
+
+    def test_duty_and_product_prose_skipped(self):
+        """BUG 5: job-duty / product-name prose where a geo token is incidental is
+        not a location label ('Hybrid car parts', 'Varna Beach festival app',
+        'remote support … in Sofia')."""
+        for span in [
+            "Hybrid car parts warehouse",
+            "Опит с Varna Beach festival app",
+            "Remote support for clients in Sofia",
+            "Provide remote support to our Varna team",
+            "You will relocate to Plovdiv",
+        ]:
+            assert classify_location_spans([span]) == "", f"prose not skipped: {span!r}"
+
+    def test_town_token_matched_on_word_boundary(self):
+        """BUG 6: 'ruse' must not match inside 'Ruseville' — town tokens are matched
+        on word boundaries, not as bare substrings."""
+        assert classify_location_spans(["Ruseville Software"]) == ""

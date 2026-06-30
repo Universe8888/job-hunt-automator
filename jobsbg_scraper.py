@@ -49,13 +49,29 @@ _GEO_TRAP_PHRASES = (
 # Company-name false-matches (live 309-run): the "IT Jobs of <Company> EOOD"
 # other-jobs link text matched because BG legal names embed a city/country token
 # ('Akkodis Bulgaria EOOD', 'ФЕСТО БЪЛГАРИЯ ЕООД'). Skip any span that is a
-# company-jobs link OR ends in a BG legal-entity suffix — those are never the
-# work location. Suffixes matched on a trailing word boundary so a town named
-# 'Ad...' is not clipped.
+# company-jobs link OR carries a legal-entity token — those are never the work
+# location. The entity token is matched as a STANDALONE WORD anywhere in the span
+# (leading/mid/trailing), not just at end-of-string: a 60-case adversarial
+# stress-test (2026-06-30) showed 'Akkodis Bulgaria EOOD - Sofia office' and
+# leading 'Ad Astra Bulgaria' / 'ЕАД Русе' slipping through an end-anchored regex.
 _GEO_COMPANY_PREFIXES = ("jobs of", "it jobs of")
 _GEO_ENTITY_SUFFIX = re.compile(
-    r"(?:^|\s)(?:eood|ood|ead|ad|jsc|ltd|llc|еоод|оод|еад|ад)\.?$",
+    r"\b(?:eood|ood|ead|ad|jsc|ltd|llc|gmbh|gbr|ag|srl|sa|еоод|оод|еад|ад)\b\.?",
     re.IGNORECASE | re.UNICODE,
+)
+# Negation / on-site markers that DISQUALIFY a remote phrase ('No remote work —
+# strictly on-site'): the span mentions remote only to deny it.
+_GEO_REMOTE_NEGATORS = (
+    "no remote", "not remote", "without remote", "on-site", "onsite",
+    "on site", "strictly", "no home office", "no work from home",
+)
+# Prose / job-duty markers: a span containing one of these is describing a DUTY
+# or sentence, not labelling a location ('Provide remote support to our Varna
+# team', 'You will relocate to Plovdiv', 'Hybrid car parts warehouse').
+_GEO_PROSE_MARKERS = (
+    "will", "provide", "support for", "support to", "relocate", "located in",
+    "welcome", "possible", "covered", "festival", "warehouse", "team",
+    "clients", "опит", "near",
 )
 
 
@@ -102,14 +118,25 @@ def classify_location_spans(span_texts: list[str]) -> str:
         low = t.lower()
         if any(trap in low for trap in _GEO_TRAP_PHRASES):
             continue  # geo word present but not a work location
-        # Company-name false-match: a "Jobs of …" link or a legal-entity suffix
-        # (EOOD/ЕООД/…) is a company, never the work location.
+        # Company-name false-match: a "Jobs of …" link or a legal-entity token
+        # (EOOD/ЕООД/GmbH/…) anywhere in the span is a company, never a location.
         if any(low.startswith(p) for p in _GEO_COMPANY_PREFIXES):
             continue
         if _GEO_ENTITY_SUFFIX.search(t):
             continue
-        if any(tok in low for tok in _GEO_TOWN_TOKENS) or \
-                any(ph in low for ph in _GEO_REMOTE_PHRASES):
+        # Job-duty / product-name prose where a geo token is incidental, not a label.
+        if any(marker in low for marker in _GEO_PROSE_MARKERS):
+            continue
+        # Town tokens on WORD BOUNDARIES so 'ruse' does not match inside 'Ruseville'.
+        town_hit = any(
+            re.search(r"\b" + re.escape(tok) + r"\b", low) for tok in _GEO_TOWN_TOKENS
+        )
+        if town_hit:
+            return t
+        # Remote phrase — but only if not negated ('No remote work, strictly on-site').
+        if any(ph in low for ph in _GEO_REMOTE_PHRASES):
+            if any(neg in low for neg in _GEO_REMOTE_NEGATORS):
+                continue
             return t
     return ""
 
