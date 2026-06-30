@@ -414,7 +414,38 @@ NET_TO_GROSS_FACTOR = 1.146
 # RANK  (apply-first sorts on top)
 # ──────────────────────────────────────────────
 # rank = w_lane*lane_hits + w_geo*geo_certainty + w_comp*comp_headroom
-RANK_WEIGHTS = {"w_lane": 1.0, "w_geo": 1.0, "w_comp": 1.0}  # tune later
+#      + w_fit*fit_signal      (how much of the JD YOU can deliver; 0..1 from match_score)
+#      - w_gap*seniority_gap   (docks roles demanding seniority/skills you lack)
+# w_fit/w_gap default-safe: both terms are 0 when match_score / SENIORITY_GAP_TERMS
+# are absent, so rank reduces to the original lane+geo+comp behaviour.
+RANK_WEIGHTS = {
+    "w_lane": 1.0, "w_geo": 1.0, "w_comp": 1.0,
+    "w_fit": 4.0,   # set 0.0 to disable candidate-fit lift
+    "w_gap": 1.5,   # set 0.0 to disable over-seniority de-rank
+}
+
+# SENIORITY_GAP_TERMS: phrases signalling a role is ABOVE your record. Each distinct
+# hit subtracts w_gap from the rank (DE-RANK ONLY — never flips a verdict). Populate
+# in your private config.py with what you'd actually be screened out on. Empty here
+# (generic template) so the public example penalizes nothing by default.
+# TIP: scope governance-adjacent concepts to DEMAND-FORM ("lead/own/run/perform X")
+# so a role that merely *lists* the concept as oversight scope isn't false-penalized;
+# and avoid bare ubiquitous phrases (e.g. "at scale") that fire on benign JD language.
+# Terms containing punctuation (e.g. "ci/cd security") are matched after the same
+# normalizer applied to the posting text, so they fire correctly.
+SENIORITY_GAP_TERMS: list[str] = []
+
+# GAP_PENALTY_CAP: max number of distinct gap hits CHARGED to the rank (0 = uncapped).
+# Stops a sprawling senior JD from running the penalty far past the +w_fit ceiling
+# (which would make the fit lever a no-op). 0 here = legacy uncapped; ~3 recommended.
+GAP_PENALTY_CAP = 0
+
+# FIT_NORMALIZER_PCT: the match_score percent treated as a "full" fit (-> fit_signal 1.0).
+# match_score divides matched skill weight by the sum of ALL your skills, so real
+# postings often score only ~5-16%; dividing by a flat 100 makes w_fit a near-no-op.
+# Lower this (e.g. ~50) to rescale the realistic band so fit competes with the gap
+# penalty. 100.0 = legacy raw /100 behaviour.
+FIT_NORMALIZER_PCT = 100.0
 
 # ──────────────────────────────────────────────
 # Output CSVs (3-gate rebuild — two destinations, nothing silently dropped)

@@ -63,7 +63,19 @@ MOCK_LOCATION_DENY = [
 MOCK_LOCATION_SOFT = ["hybrid", "inferred-eor"]
 MOCK_FX_RATES = {"EUR": 1.0, "BGN": 1.0 / 1.95583, "USD": 0.92, "GBP": 1.17}
 MOCK_NET_TO_GROSS = 1.146
-MOCK_RANK_WEIGHTS = {"w_lane": 1.0, "w_geo": 1.0, "w_comp": 1.0}
+MOCK_RANK_WEIGHTS = {"w_lane": 1.0, "w_geo": 1.0, "w_comp": 1.0, "w_fit": 4.0, "w_gap": 1.5}
+# Over-seniority demands the candidate's record doesn't meet (de-rank only).
+# Includes 'ci/cd security' (punctuation that _norm_lane rewrites) to guard the
+# normalize-then-compile bugfix, and 'perform penetration testing' demand-form.
+MOCK_SENIORITY_GAP_TERMS = [
+    "10+ years", "build and lead a team", "incident commander",
+    "perform penetration testing", "cissp", "ci/cd security",
+]
+# Unit-test defaults pin the LEGACY behaviour the existing E-group rank tests assume:
+# fit normalized against /100, gap uncapped. New tests override these locally to
+# exercise the production cap (3) and normalizer (50).
+MOCK_GAP_PENALTY_CAP = 0       # uncapped (legacy)
+MOCK_FIT_NORMALIZER_PCT = 100.0  # raw /100 (legacy)
 
 
 @pytest.fixture
@@ -88,6 +100,9 @@ def override_config(monkeypatch):
     monkeypatch.setattr(gatekeeper, "FX_RATES", MOCK_FX_RATES)
     monkeypatch.setattr(gatekeeper, "NET_TO_GROSS_FACTOR", MOCK_NET_TO_GROSS)
     monkeypatch.setattr(gatekeeper, "RANK_WEIGHTS", MOCK_RANK_WEIGHTS)
+    monkeypatch.setattr(gatekeeper, "SENIORITY_GAP_TERMS", MOCK_SENIORITY_GAP_TERMS)
+    monkeypatch.setattr(gatekeeper, "GAP_PENALTY_CAP", MOCK_GAP_PENALTY_CAP)
+    monkeypatch.setattr(gatekeeper, "FIT_NORMALIZER_PCT", MOCK_FIT_NORMALIZER_PCT)
 
 
 @pytest.fixture
@@ -496,6 +511,35 @@ def test_parse_comp_percent_glued_number_not_salary(override_config):
     assert pc is None
 
 
+# --- Regression: live false-parse — a headcount / team-size number is NOT comp.
+# Found in the 309-job re-rate (DBA @ DEVEXPERTS): "...exchange since 2015. With
+# 800+ experts, we deliver..." parsed '800' as €800/mo -> €9,600/yr, which
+# hard-rejects a role on a phantom salary. Company headcount must never be comp.
+
+def test_parse_comp_headcount_not_salary(override_config):
+    """C20 (live false-parse, DBA @ DEVEXPERTS, verbatim): '...with a team of more
+    than 800+ professionals, the comp...' parsed '800' as €800/mo -> €9,600/yr
+    because 'comp' (a salary cue) sits in the number's window. A headcount number
+    must never be read as salary."""
+    pc = parse_comp("We are a team of more than 800+ professionals, the company "
+                    "delivers innovative software.")
+    assert pc is None
+
+
+def test_parse_comp_team_of_count_not_salary(override_config):
+    """C21: 'a team of 1500' and similar team-size counts are headcount, not comp."""
+    pc = parse_comp("Join a team of 1500 professionals. Salary discussed at interview.")
+    assert pc is None
+
+
+def test_parse_comp_real_salary_near_headcount_still_parses(override_config):
+    """C22 (guard against over-correction): the headcount skip must drop only the
+    headcount number — a real disclosed salary in the same text still parses."""
+    pc = parse_comp("We are 800+ experts. Salary: €140,000 gross per year.")
+    assert pc is not None
+    assert pc.top_eur_gross_yr == 140000.0
+
+
 # =====================================================================
 # GROUP D — passes_comp_gate BANDS + BOUNDARIES (FIX #3)
 # =====================================================================
@@ -686,6 +730,149 @@ def test_evaluate_rank_reads_weights_from_config(override_config, monkeypatch):
     v = evaluate(job)
     assert v.verdict == "keep"
     assert v.rank == pytest.approx(6.0)
+
+
+def test_rank_fit_term_lifts_matching_role(override_config):
+    """E5 (NEW — fit): a job carrying match_score gains w_fit*(score/100).
+    Base rank 5.0 (3 lane + 1 geo + 1 comp) + 4.0*0.75 = 8.0."""
+    job = J(title="AI Governance Engineer",
+            description=("own AI governance, run LLM eval, EU AI Act, fully remote "
+                         "across EMEA, €140,000 gross/yr"),
+            location="Remote EMEA")
+    job["match_score"] = 75.0           # attached upstream by profile_matcher
+    v = evaluate(job)
+    assert v.verdict == "keep"
+    assert v.rank == pytest.approx(8.0)     # 5.0 + 4.0*0.75
+    assert any("fit" in r.lower() for r in v.reasons)
+
+
+def test_rank_fit_absent_is_backcompat_zero(override_config):
+    """E5b (NEW — back-compat): no match_score -> fit term is 0, rank unchanged."""
+    job = J(title="AI Governance Engineer",
+            description=("AI governance, LLM eval, EU AI Act, fully remote EMEA, "
+                         "€140,000 gross/yr"),
+            location="Remote EMEA")
+    v = evaluate(job)
+    assert v.rank == pytest.approx(5.0)     # identical to E1 — no fit, no gap
+
+
+def test_rank_over_seniority_penalty_docks_sprawling_role(override_config):
+    """E6 (NEW — gap, THE 14.0 FIX): a keyword-dense senior JD demanding tenure +
+    people-leadership + SecOps the candidate lacks is docked w_gap per distinct hit.
+    Lane=3, geo=1, comp=1 (base 5.0); 3 gap hits (10+ years, build and lead a team,
+    incident commander) -> -1.5*3 = -4.5 -> rank 0.5."""
+    job = J(title="AI Governance, Risk & Compliance Manager",
+            description=("own AI governance, EU AI Act, LLM eval. Requires 10+ years "
+                         "in security, build and lead a team, act as incident commander. "
+                         "Fully remote EMEA, €140,000 gross/yr"),
+            location="Remote EMEA")
+    v = evaluate(job)
+    assert v.verdict == "keep"               # de-rank only — NEVER flips the verdict
+    assert v.rank == pytest.approx(0.5)      # 5.0 - 1.5*3
+    assert any("over-seniority" in r.lower() for r in v.reasons)
+
+
+def test_rank_tight_fit_role_outranks_sprawling_monster(override_config):
+    """E7 (NEW — the whole point): a tight, in-altitude AI-Gov role the candidate
+    fits OUT-RANKS the sprawling over-senior JD, reversing the keyword-only order."""
+    monster = J(title="AI Governance, Risk & Compliance Manager",
+                description=("AI governance, EU AI Act, LLM eval, MCP, RAG, SAM. "
+                             "10+ years, build and lead a team, incident commander, "
+                             "penetration testing, CISSP. Remote EMEA, €140,000 gross/yr"),
+                location="Remote EMEA")
+    monster["match_score"] = 25.0            # candidate matches little of it
+    tight = J(title="AI Governance Analyst",
+              description=("AI governance, EU AI Act, fully remote EMEA, "
+                           "€130,000 gross/yr"),
+              location="Remote EMEA")
+    tight["match_score"] = 80.0              # strong personal fit
+    vm = evaluate(monster)
+    vt = evaluate(tight)
+    # Keyword-only, the monster would win on lane_hits; with fit+gap the tight role wins.
+    assert vt.rank > vm.rank
+
+
+def test_gap_term_with_punctuation_matches_after_normalize(override_config):
+    """E8 (NEW — BUGFIX: ci/cd dead-rule). A gap term whose _norm_lane form diverges
+    from its raw form ('ci/cd security' -> 'ci cd security') must still fire. Before
+    the normalize-then-compile fix this matched NOTHING and silently escaped the
+    penalty. The hit label is reported as the ORIGINAL term for readable audit."""
+    job = J(title="Security Engineer",
+            description=("own AI governance, EU AI Act, LLM eval. You will own CI/CD "
+                         "security and pipeline hardening. Remote EMEA, €140,000 gross/yr"),
+            location="Remote EMEA")
+    v = evaluate(job)
+    hits = gatekeeper._seniority_gap_hits(job)
+    assert "ci/cd security" in hits          # original-term label, matched via norm form
+    # base 5.0 (3 lane + geo + comp) - 1.5*1 gap = 3.5
+    assert v.rank == pytest.approx(3.5)
+    assert v.verdict == "keep"               # de-rank only
+
+
+def test_gap_penalty_cap_limits_charged_hits(monkeypatch, override_config):
+    """E9 (NEW — Fix #4: cap). With GAP_PENALTY_CAP=3, a JD hitting 4 distinct gap
+    terms is charged only 3 (-4.5), not 4 (-6.0). Reason string notes the cap."""
+    monkeypatch.setattr(gatekeeper, "GAP_PENALTY_CAP", 3)
+    job = J(title="AI Governance Lead",
+            description=("AI governance, EU AI Act, LLM eval. Requires 10+ years, "
+                         "build and lead a team, act as incident commander, and you "
+                         "will perform penetration testing. Remote EMEA, €140,000 gross/yr"),
+            location="Remote EMEA")
+    v = evaluate(job)
+    hits = gatekeeper._seniority_gap_hits(job)
+    assert len(hits) == 4                     # all four still detected...
+    assert v.rank == pytest.approx(0.5)       # ...but only 3 charged: 5.0 - 1.5*3
+    assert any("capped at 3 of 4" in r for r in v.reasons)
+
+
+def test_gap_penalty_uncapped_when_cap_zero(override_config):
+    """E9b (NEW — cap off): GAP_PENALTY_CAP=0 (the fixture default) charges every hit,
+    preserving the original uncapped behaviour."""
+    job = J(title="AI Governance Lead",
+            description=("AI governance, EU AI Act, LLM eval. 10+ years, build and lead "
+                         "a team, act as incident commander, perform penetration testing. "
+                         "Remote EMEA, €140,000 gross/yr"),
+            location="Remote EMEA")
+    v = evaluate(job)
+    assert len(gatekeeper._seniority_gap_hits(job)) == 4
+    assert v.rank == pytest.approx(-1.0)      # 5.0 - 1.5*4, uncapped
+
+
+def test_fit_normalizer_rescales_realistic_scores(monkeypatch, override_config):
+    """E10 (NEW — Fix #6: fit normalizer). With FIT_NORMALIZER_PCT=50, a realistic
+    16% match maps to fit_signal 0.32 -> +1.28 (not +0.64 under raw /100), making fit
+    a real lever. Still clamped to 1.0 for an unusually high score."""
+    monkeypatch.setattr(gatekeeper, "FIT_NORMALIZER_PCT", 50.0)
+    job = J(title="AI Governance Analyst",
+            description=("AI governance, EU AI Act, LLM eval, fully remote EMEA, "
+                         "€140,000 gross/yr"),
+            location="Remote EMEA")
+    job["match_score"] = 16.0
+    v = evaluate(job)
+    # base 5.0 + w_fit(4.0)*min(16/50,1)=0.32 -> +1.28 = 6.28
+    assert v.rank == pytest.approx(6.28)
+    # clamp: a 60% score over a 50 normalizer is still capped at fit_signal 1.0
+    job2 = J(title="AI Governance Analyst",
+             description="AI governance, EU AI Act, LLM eval, remote EMEA, €140,000 gross/yr",
+             location="Remote EMEA")
+    job2["match_score"] = 60.0
+    assert gatekeeper._fit_signal(job2) == pytest.approx(1.0)
+
+
+def test_governance_adjacent_term_does_not_false_fire(override_config):
+    """E11 (NEW — Fix #2/#3: false-penalty). A compliance role that merely LISTS a
+    security concept as oversight scope must NOT be docked; only demand-form fires.
+    'knowledge of vulnerability management' -> no hit (not in mock list as bare term);
+    'at scale' is gone entirely so benign 'automation at scale' never fires."""
+    job = J(title="AI Governance Analyst",
+            description=("map AI governance controls including knowledge of vulnerability "
+                         "management evidence; build automation at scale; EU AI Act; "
+                         "remote EMEA, €130,000 gross/yr"),
+            location="Remote EMEA")
+    hits = gatekeeper._seniority_gap_hits(job)
+    assert hits == []                         # no false gap on governance-adjacent language
+    v = evaluate(job)
+    assert not any("over-seniority" in r.lower() for r in v.reasons)
 
 
 # =====================================================================

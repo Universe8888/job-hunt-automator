@@ -54,6 +54,19 @@ FX_RATES = config.FX_RATES
 NET_TO_GROSS_FACTOR = config.NET_TO_GROSS_FACTOR
 RANK_WEIGHTS = config.RANK_WEIGHTS
 
+# Candidate-fit rank inputs (NEW). Default empty/absent so a config that predates
+# these keys keeps the original lane+geo+comp rank behaviour exactly.
+#   - SENIORITY_GAP_TERMS: phrases signalling a role is above the candidate's record;
+#     each distinct hit docks w_gap from rank (DE-RANK ONLY, never flips a verdict).
+#   - GAP_PENALTY_CAP: max number of gap hits CHARGED (0 = uncapped). Stops a sprawling
+#     senior JD from running the penalty away past the +w_fit ceiling.
+#   - FIT_NORMALIZER_PCT: the match_score (%) treated as a "full" fit (-> fit_signal 1.0).
+#     match_score divides by the sum of ALL skill weights, so real postings score only
+#     ~5-16%; without this, w_fit is a near-no-op. 100 = legacy raw behaviour.
+SENIORITY_GAP_TERMS = getattr(config, "SENIORITY_GAP_TERMS", [])
+GAP_PENALTY_CAP = getattr(config, "GAP_PENALTY_CAP", 0)
+FIT_NORMALIZER_PCT = getattr(config, "FIT_NORMALIZER_PCT", 100.0)
+
 # Red-team-mandated tunables — default if absent from config.
 DENY_PENALTY = getattr(config, "DENY_PENALTY", 0.5)
 WORKING_DAYS_PER_YEAR = getattr(config, "WORKING_DAYS_PER_YEAR", 220)
@@ -118,6 +131,33 @@ def _compiled(terms) -> list[tuple[str, "re.Pattern"]]:
     if cached is None:
         cached = [(t, re.compile(r"\b" + re.escape(t) + r"\b")) for t in terms]
         _RX_CACHE[key] = cached
+    return cached
+
+
+_RX_CACHE_NORM: dict[int, list[tuple[str, "re.Pattern"]]] = {}
+
+
+def _compiled_norm(terms) -> list[tuple[str, "re.Pattern"]]:
+    """Like _compiled, but each term's PATTERN is built from its _norm_lane form so
+    it matches the normalized surface, while the returned LABEL is the original term.
+
+    This is the single normalize-then-compile path (single-canonical-mapping): any
+    term containing punctuation _norm_lane rewrites (e.g. 'ci/cd security') is
+    compiled from its normalized form ('ci cd security') and therefore can actually
+    match. Separate cache from _compiled() since the compiled pattern differs.
+    A term that normalizes to empty is skipped (it could never be a real signal).
+    """
+    key = id(terms)
+    cached = _RX_CACHE_NORM.get(key)
+    if cached is None:
+        built = []
+        for t in terms:
+            nt = _norm_lane(t)
+            if not nt:
+                continue
+            built.append((t, re.compile(r"\b" + re.escape(nt) + r"\b")))
+        cached = built
+        _RX_CACHE_NORM[key] = cached
     return cached
 
 
@@ -391,6 +431,15 @@ _SALARY_CUES = (
 )
 # Non-comp number contexts to actively exclude (standards numbers etc.).
 _NONCOMP_NEG = ("iso", "soc", "27001", "27002", "42001", "nist", "version", "v.")
+# Headcount / team-size words: a number adjacent to one of these is company size,
+# never compensation. Live false-parse (DBA @ DEVEXPERTS): "a team of more than
+# 800+ professionals, the comp..." parsed 800 as €800/mo -> €9,600/yr because
+# 'comp' sat in the window. Matched as word-boundary cues near the number.
+_HEADCOUNT_WORDS = (
+    "professionals", "experts", "employees", "people", "colleagues",
+    "specialists", "engineers", "developers", "members", "staff",
+    "team of", "team members", "headcount", "fte", "consultants",
+)
 
 _MONTHLY_CUES = (
     "/mo", "/month", "per month", "a month", " pm", "месечно", "на месец",
@@ -547,6 +596,15 @@ def parse_comp(text: str) -> ParsedComp | None:
         # Exclude standards/version numbers even if a cue is incidentally nearby.
         tight = _window(t, m.start(), m.end(), 6)
         if any(neg in tight for neg in _NONCOMP_NEG):
+            continue
+
+        # Headcount guard: a number immediately followed by a headcount word
+        # ("800+ professionals", "team of 1500 employees") is company size, not
+        # comp. Check only the run just AFTER the number (+18 chars) so a real
+        # salary that merely shares a wider window with a headcount word elsewhere
+        # ("we are 800+ experts. Salary: €140,000") is NOT dropped.
+        post_run = t[m.end():m.end() + 18]
+        if any(re.search(r"\b" + re.escape(hw), post_run) for hw in _HEADCOUNT_WORDS):
             continue
 
         # A number glued to a degree or percent sign is not money: "360° sales",
@@ -812,6 +870,56 @@ def passes_comp_gate(parsed: ParsedComp | None) -> GateResult:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# RANK FIT INPUTS (NEW) — candidate-aware rank terms. Pure, no I/O.
+# ──────────────────────────────────────────────────────────────────────────
+def _fit_signal(job: dict) -> float:
+    """0..1 fraction of the JD the candidate can deliver.
+
+    Reuses the INFO-only skill overlap already attached upstream by
+    profile_matcher.match_jobs (job['match_score'], a 0..100 percent). Returns 0.0
+    when absent (e.g. unit tests that call evaluate() directly), so the fit term
+    vanishes and rank reduces to the original lane+geo+comp formula.
+
+    Normalized against FIT_NORMALIZER_PCT (validation finding): match_score divides
+    the matched skill weight by the sum of ALL ~45 skills, so a strong real posting
+    only scores ~10-16%. Dividing by a flat 100 made w_fit a near-no-op (+0.2..+0.6)
+    vs a multi-point gap penalty. Treating FIT_NORMALIZER_PCT as "full fit" rescales
+    the realistic band to ~0..1 so the fit lever actually competes. Still clamped to
+    1.0, so an unusually high score can't over-reward. 100.0 = legacy raw behaviour.
+    """
+    raw = job.get("match_score")
+    if raw is None:
+        return 0.0
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    denom = FIT_NORMALIZER_PCT if FIT_NORMALIZER_PCT else 100.0
+    return max(0.0, min(1.0, pct / denom))
+
+
+def _seniority_gap_hits(job: dict) -> list[str]:
+    """Distinct SENIORITY_GAP_TERMS present in title+body (word-boundary, normalized).
+
+    Each hit marks a demand the role makes that the candidate's record does not
+    meet (tenure bar, people-leadership, SecOps/IR spine, deep cloud-at-scale,
+    heavyweight cert). Used ONLY to de-rank — never to change the verdict.
+
+    BUGFIX (validation finding): the matcher MUST compile each term through the
+    SAME normalizer applied to the surface (_norm_lane). Previously the surface was
+    normalized (e.g. 'ci/cd security' -> 'ci cd security') but the regex was built
+    from the RAW term (\\bci/cd security\\b), so any term whose normalization
+    diverges from its raw form (the only one was 'ci/cd security') was a DEAD RULE
+    that never matched. _compiled_norm() closes the whole class, not just that term.
+    The returned hit label is the ORIGINAL term (for readable audit reasons).
+    """
+    if not SENIORITY_GAP_TERMS:
+        return []
+    surface = _norm_lane((job.get("title", "") + " " + job.get("description", "")))
+    return [orig for orig, rx in _compiled_norm(SENIORITY_GAP_TERMS) if rx.search(surface)]
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # PUBLIC API — evaluate
 # ──────────────────────────────────────────────────────────────────────────
 def evaluate(job: dict) -> Verdict:
@@ -857,11 +965,38 @@ def evaluate(job: dict) -> Verdict:
         verdict = "keep"
 
     w = RANK_WEIGHTS
+    # Base posting↔lane rank (unchanged).
     rank = (
         w.get("w_lane", 1.0) * gate1.signal
         + w.get("w_geo", 1.0) * gate2.signal
         + w.get("w_comp", 1.0) * gate3.signal
     )
+
+    # Candidate-aware adjustments (NEW). Both default to 0 when their inputs are
+    # absent (no match_score / empty SENIORITY_GAP_TERMS), so rank is identical to
+    # the original formula unless the candidate profile is wired in.
+    fit = _fit_signal(job)                       # 0..1
+    gap_hits = _seniority_gap_hits(job)          # distinct over-seniority demands
+
+    # Gap penalty is CAPPED (validation finding): an uncapped count let a sprawling
+    # senior JD reach -19.5, dwarfing the +w_fit ceiling so the fit term became a
+    # no-op. Capping the *charged* hits keeps both levers comparable while still
+    # sinking over-senior roles. GAP_PENALTY_CAP=0 disables the cap (uncapped).
+    charged_gap = len(gap_hits)
+    if GAP_PENALTY_CAP and charged_gap > GAP_PENALTY_CAP:
+        charged_gap = GAP_PENALTY_CAP
+
+    rank += w.get("w_fit", 0.0) * fit
+    rank -= w.get("w_gap", 0.0) * float(charged_gap)
+
+    if fit:
+        reasons.append(f"RANK fit: +{w.get('w_fit', 0.0) * fit:.2f} "
+                       f"({fit * 100:.0f}% skill overlap)")
+    if gap_hits:
+        capped_note = (f"; capped at {GAP_PENALTY_CAP} of {len(gap_hits)}"
+                       if GAP_PENALTY_CAP and len(gap_hits) > GAP_PENALTY_CAP else "")
+        reasons.append(f"RANK over-seniority penalty: -{w.get('w_gap', 0.0) * charged_gap:.2f} "
+                       f"via {gap_hits[:6]}{capped_note}")
 
     return Verdict(
         verdict=verdict,
