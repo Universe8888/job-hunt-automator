@@ -22,29 +22,30 @@ RESULTS_PER_PAGE = 15
 
 DEBUG_HTML_DIR = "debug_html"
 
-# Detail-page DOM selectors for structured location extraction (USER DECISION #3).
-# Ordered most-specific -> most-general; first plausible non-empty hit wins.
-# Each is guarded by count() > 0 and read via inner_text(). Derived defensively from
-# the known card DOM (mdc-card, secondary-text) and the job-view containers already
-# read by fetch_job_description; confirm/adjust against a real detail page captured
-# via _dump_debug_html(). The gate's body keyword scan is the safety net if all miss.
-GEO_DETAIL_SELECTORS = [
-    # 1. Explicit location anchor (jobs.bg links location to a town search)
-    "a[href*='location_sid']",
-    "a[href*='towns']",
-    # 2. Structured info rows in the left/header column
-    ".job-view-location",
-    ".mdc-card .location",
-    "#jobView .location",
-    "span.location",
-    # 3. Labelled info row: a secondary-text node carrying the place
-    ".job-view-left-column .secondary-text",
-    "#jobViewContent .secondary-text",
-    # 4. The address / map block jobs.bg renders for office roles
-    ".job-view-address",
-    "[itemprop='jobLocation']",
-    "[itemprop='addressLocality']",
-]
+# Detail-page DOM: jobs.bg carries the work location ONLY as bare <span> leaves
+# with no class / itemprop / location-anchor hook (verified against live detail
+# pages 8514748 / 8514545 / 8514820 on 2026-06-29 — the earlier selector list
+# below matched NOTHING, so structured-location extraction was silently 0/30).
+# We therefore grab the short leaf-span texts and classify them by CONTENT.
+GEO_SPAN_SELECTOR = "span"
+# Allowlist phrases (lower-cased) that mark a genuine WORK location. BG towns +
+# remote/hybrid phrasing the gate's vocabulary already understands.
+_GEO_TOWN_TOKENS = (
+    "sofia", "софия", "plovdiv", "пловдив", "varna", "варна",
+    "burgas", "бургас", "ruse", "русе", "stara zagora", "стара загора",
+    "bulgaria", "българия",
+)
+_GEO_REMOTE_PHRASES = (
+    "fully remote work", "fully remote", "remote work", "remote position",
+    "work from home", "home office", "hybrid", "дистанционна работа",
+    "изцяло дистанционно", "home-based",
+)
+# False friends: spans that CONTAIN a geo word but do NOT describe the work
+# location. 'Remote interview' is a hiring-process note, not a remote job.
+_GEO_TRAP_PHRASES = (
+    "remote interview", "remote interviewing", "online interview",
+    "video interview", "remote onboarding",
+)
 
 
 # Precompiled once (looks_like_sentence is called per-selector in a loop).
@@ -68,6 +69,32 @@ def looks_like_sentence(text: str) -> bool:
     if _SENTENCE_END.search(text.strip()):
         return True
     return False
+
+
+def classify_location_spans(span_texts: list[str]) -> str:
+    """Pick a work-location label from candidate detail-page <span> texts.
+
+    jobs.bg detail pages have no structured location element — the town /
+    remote phrase is just a bare <span>. We scan candidates in document order
+    and return the first that is a genuine work location: a short (non-prose)
+    string matching the BG-town or remote/hybrid allowlist, that is NOT a known
+    false-friend ('Remote interview' describes the interview, not the job).
+
+    Returns "" when nothing usable is found, so the caller leaves job['location']
+    blank and Gate 2 falls back to its body keyword scan -> soft.
+    Pure (no I/O) so it is unit-testable without a browser.
+    """
+    for raw in span_texts:
+        t = (raw or "").strip()
+        if not t or len(t) > 45 or looks_like_sentence(t):
+            continue
+        low = t.lower()
+        if any(trap in low for trap in _GEO_TRAP_PHRASES):
+            continue  # geo word present but not a work location
+        if any(tok in low for tok in _GEO_TOWN_TOKENS) or \
+                any(ph in low for ph in _GEO_REMOTE_PHRASES):
+            return t
+    return ""
 
 
 def build_jobsbg_search_url(keyword: str, location: dict, offset: int = 0) -> str:
@@ -122,8 +149,8 @@ def parse_jobsbg_cards(html: str) -> list[dict]:
             if company_fallback:
                 job["company"] = company_fallback.get_text(strip=True)
 
-        # Date extraction
-        time_el = card.find("div", class_="secondary-text", text=re.compile(r"\d{2}\.\d{2}\.\d{4}"))
+        # Date extraction (bs4 4.x: use string=, not the deprecated text=).
+        time_el = card.find("div", class_="secondary-text", string=re.compile(r"\d{2}\.\d{2}\.\d{4}"))
         if not time_el:
             # Fallback for relative dates like "today" or "yesterday"
             time_el = card.find("div", class_="secondary-text")
@@ -338,24 +365,22 @@ async def scrape_jobs(page, keyword: str, location: dict,
 
 
 async def _extract_detail_location(page, job_url: str) -> str:
-    """Pull a structured location string from the jobs.bg detail-page DOM.
+    """Pull a work-location string from the jobs.bg detail-page DOM.
 
-    Loops GEO_DETAIL_SELECTORS (first plausible hit wins); each guarded by
-    count() > 0 and read via inner_text(). Accepts only short, non-prose
-    strings (<= 60 chars, not looks_like_sentence) so a description paragraph
-    is never mistaken for a location. Returns "" if nothing usable is found,
-    in which case the gate falls back to its body keyword scan -> soft.
+    jobs.bg exposes the location only as bare <span> leaves (no class/itemprop),
+    so we collect the short span texts and hand them to the pure
+    classify_location_spans() classifier (allowlist of BG-towns / remote phrases,
+    minus known traps like 'Remote interview'). Returns "" if nothing usable is
+    found, in which case the gate falls back to its body keyword scan -> soft.
     """
-    for sel in GEO_DETAIL_SELECTORS:
-        try:
-            el = page.locator(sel)
-            if await el.count() > 0:
-                t = (await el.first.inner_text()).strip()
-                if t and len(t) <= 60 and not looks_like_sentence(t):
-                    return t
-        except Exception:
-            logger.debug("  ⚠️  Geo selector %s failed on %s", sel, job_url[:60])
-    return ""
+    try:
+        # One round-trip for all span texts (vs N sequential nth() reads); the pure
+        # classifier does the short-leaf filtering and content matching.
+        texts = await page.locator(GEO_SPAN_SELECTOR).all_inner_texts()
+        return classify_location_spans([t.strip() for t in texts if t and t.strip()])
+    except Exception:
+        logger.debug("  ⚠️  Geo span scan failed on %s", job_url[:60])
+        return ""
 
 
 async def fetch_job_description(page, job_url: str, job: dict | None = None) -> str:

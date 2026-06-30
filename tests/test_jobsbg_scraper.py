@@ -1,8 +1,12 @@
-"""Tests for jobsbg_scraper.py — URL building, HTML card parsing."""
+"""Tests for jobsbg_scraper.py — URL building, HTML card parsing, geo classifier."""
 
 import pytest
 
-from jobsbg_scraper import build_jobsbg_search_url, parse_jobsbg_cards
+from jobsbg_scraper import (
+    build_jobsbg_search_url,
+    parse_jobsbg_cards,
+    classify_location_spans,
+)
 
 
 SAMPLE_LOCATION = {
@@ -159,3 +163,59 @@ class TestParseJobsbgCards:
         jobs = parse_jobsbg_cards(html)
         assert len(jobs) == 1
         assert "star" not in jobs[0]["title"].lower()
+
+    def test_extracts_date_from_secondary_text(self):
+        """Date is pulled from a secondary-text node matching dd.mm.yyyy, and the
+        Ref.No suffix is stripped. Locks behavior across the bs4 text=->string= rename."""
+        html = """
+        <html>
+            <div class="mdc-card">
+                <a class="black-link-b" href="/en/job/dated-job" title="Dated Job">Dated Job</a>
+                <div class="secondary-text">Some Company</div>
+                <div class="secondary-text">20.03.2026, Ref.No:Ps_1</div>
+            </div>
+        </html>
+        """
+        jobs = parse_jobsbg_cards(html)
+        assert len(jobs) == 1
+        assert jobs[0]["date"] == "20.03.2026"
+
+
+class TestClassifyLocationSpans:
+    """Pure location classifier (no browser). jobs.bg detail pages carry location
+    only as bare <span>s identifiable by CONTENT (no class/itemprop hook):
+    'Sofia', 'Fully remote work', 'Remote interview'. The classifier matches an
+    allowlist of BG-town / remote phrases and skips known false-friends.
+
+    Live DOM evidence (2026-06-29 sample, job 8514748 / 8514545 / 8514820).
+    """
+
+    def test_picks_known_bg_town(self):
+        """A bare 'Sofia' span is a real work location."""
+        assert classify_location_spans(["Sofia", "Remote interview"]) == "Sofia"
+
+    def test_remote_interview_is_a_trap_not_a_location(self):
+        """'Remote interview' describes the INTERVIEW, not the job — must be skipped.
+        With only that span present, no usable location is found."""
+        assert classify_location_spans(["Remote interview"]) == ""
+
+    def test_fully_remote_work_is_a_real_location(self):
+        """'Fully remote work' is a genuine work-location phrase."""
+        assert classify_location_spans(["Fully remote work"]) == "Fully remote work"
+
+    def test_town_wins_over_trailing_trap(self):
+        """First allowlisted span wins; the 'Remote interview' trap after it is ignored."""
+        assert classify_location_spans(["Plovdiv", "Remote interview", "Sofia"]) == "Plovdiv"
+
+    def test_prose_paragraph_rejected(self):
+        """A long description paragraph mentioning a town is NOT a location label."""
+        prose = ("We are a Sofia-based fintech building payment rails across the EU "
+                 "and we want you to join our growing engineering team today.")
+        assert classify_location_spans([prose]) == ""
+
+    def test_no_geo_span_returns_empty(self):
+        """No geo-ish span -> '' so the gate falls back to its body keyword scan."""
+        assert classify_location_spans(["Full time", "Permanent", "English"]) == ""
+
+    def test_empty_input_returns_empty(self):
+        assert classify_location_spans([]) == ""

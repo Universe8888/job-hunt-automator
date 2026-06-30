@@ -549,6 +549,16 @@ def parse_comp(text: str) -> ParsedComp | None:
         if any(neg in tight for neg in _NONCOMP_NEG):
             continue
 
+        # A number glued to a degree or percent sign is not money: "360° sales",
+        # "9000% growth", "20% bonus". Salary figures never carry these units.
+        # (Found in the live IT-category sample: "GROSS offers genuine 360° sales
+        # solutions" invented a €360/mo figure because the company name supplied a
+        # 'gross' cue.) Look at the char that immediately follows the matched run,
+        # skipping a single optional space.
+        after = t[m.end():m.end() + 2].lstrip()
+        if after[:1] in ("°", "%"):
+            continue
+
         mag = _to_float(num_raw)
         if mag is None or mag < 1.0:
             continue

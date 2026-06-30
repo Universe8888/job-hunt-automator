@@ -474,6 +474,28 @@ def test_comp_belowfloor_period_inferred_stays_soft(override_config):
     assert res.status == "soft"
 
 
+# --- Regression: live false-parse — a number glued to a degree/percent sign is
+# NOT compensation. Found in the 389-job IT-category sample: the SDR posting
+# "ALEX & GROSS offers genuine 360° sales solutions" parsed '360' as €360/mo
+# (the company name 'GROSS' supplied the salary cue), inventing a €4,320/yr
+# figure that would hard-reject any role whose lane gate passed.
+
+def test_parse_comp_degree_symbol_not_salary(override_config):
+    """C18 (live false-parse): '360°' must NOT be read as salary even when a
+    salary cue word ('gross', here from a company name) sits in the window."""
+    pc = parse_comp("GROSS offers genuine 360° sales solutions to clients")
+    assert pc is None
+
+
+def test_parse_comp_percent_glued_number_not_salary(override_config):
+    """C19: a number glued to '%' is never comp. Uses a percent value that would
+    SURVIVE the magnitude floor if mis-parsed ('9000%' near the cue 'gross' would
+    otherwise read as €9000/mo -> €108k/yr, an in-band false-pass), so this test
+    genuinely exercises the percent guard rather than the plausibility floor."""
+    pc = parse_comp("Our gross revenue grew 9000% year over year")
+    assert pc is None
+
+
 # =====================================================================
 # GROUP D — passes_comp_gate BANDS + BOUNDARIES (FIX #3)
 # =====================================================================
