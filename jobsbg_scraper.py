@@ -46,6 +46,17 @@ _GEO_TRAP_PHRASES = (
     "remote interview", "remote interviewing", "online interview",
     "video interview", "remote onboarding",
 )
+# Company-name false-matches (live 309-run): the "IT Jobs of <Company> EOOD"
+# other-jobs link text matched because BG legal names embed a city/country token
+# ('Akkodis Bulgaria EOOD', 'ФЕСТО БЪЛГАРИЯ ЕООД'). Skip any span that is a
+# company-jobs link OR ends in a BG legal-entity suffix — those are never the
+# work location. Suffixes matched on a trailing word boundary so a town named
+# 'Ad...' is not clipped.
+_GEO_COMPANY_PREFIXES = ("jobs of", "it jobs of")
+_GEO_ENTITY_SUFFIX = re.compile(
+    r"(?:^|\s)(?:eood|ood|ead|ad|jsc|ltd|llc|еоод|оод|еад|ад)\.?$",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 # Precompiled once (looks_like_sentence is called per-selector in a loop).
@@ -91,6 +102,12 @@ def classify_location_spans(span_texts: list[str]) -> str:
         low = t.lower()
         if any(trap in low for trap in _GEO_TRAP_PHRASES):
             continue  # geo word present but not a work location
+        # Company-name false-match: a "Jobs of …" link or a legal-entity suffix
+        # (EOOD/ЕООД/…) is a company, never the work location.
+        if any(low.startswith(p) for p in _GEO_COMPANY_PREFIXES):
+            continue
+        if _GEO_ENTITY_SUFFIX.search(t):
+            continue
         if any(tok in low for tok in _GEO_TOWN_TOKENS) or \
                 any(ph in low for ph in _GEO_REMOTE_PHRASES):
             return t

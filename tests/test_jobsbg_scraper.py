@@ -219,3 +219,34 @@ class TestClassifyLocationSpans:
 
     def test_empty_input_returns_empty(self):
         assert classify_location_spans([]) == ""
+
+    def test_company_jobs_link_is_not_a_location(self):
+        """Live bug (309-run): the 'IT Jobs of <Company> EOOD' link text false-matched
+        because the company's legal name contains a city/country token (Bulgaria,
+        СОФИЯ, БЪЛГАРИЯ). These are company-jobs-list links, never the work location."""
+        garbage = [
+            "IT Jobs of Akkodis Bulgaria EOOD",
+            "IT Jobs of ФЕСТО БЪЛГАРИЯ ЕООД",
+            "IT Jobs of ПФК ЦСКА СОФИЯ ЕАД",
+            "IT Jobs of Schwarz Digits Bulgaria EOOD",
+            "IT Jobs of А1 България ЕАД",
+        ]
+        for g in garbage:
+            assert classify_location_spans([g]) == "", f"should skip company link: {g!r}"
+
+    def test_company_link_skipped_real_location_kept(self):
+        """When the company-jobs link precedes the real location span, skip the link
+        and return the genuine town (the live ordering that polluted ~17% of rows)."""
+        spans = ["IT Jobs of Akkodis Bulgaria EOOD", "Sofia"]
+        assert classify_location_spans(spans) == "Sofia"
+
+    def test_office_address_span_still_kept(self):
+        """A real office-address span (Sofia + street + 'view map') is a valid
+        location and must survive — it is NOT a company name."""
+        addr = "Sofia; ул. „Николай Хайтов“ № 3А (view map)"
+        assert classify_location_spans([addr]) == addr
+
+    def test_bare_company_entity_suffix_skipped(self):
+        """A company-name span without the 'Jobs of' prefix but carrying an entity
+        suffix (EOOD/ЕООД/ЕАД) is still not a location."""
+        assert classify_location_spans(["Festo Bulgaria EOOD"]) == ""
