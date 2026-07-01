@@ -112,6 +112,8 @@ python main.py --site jobs.bg                     # Scrape Jobs.bg (headed, reco
 python main.py --site jobs.bg --max-jobs 100      # Limit to 100 jobs
 python main.py --site jobs.bg --cdp --days 7      # Attach to your cleared browser (DataDome bypass)
 python main.py --site jobs.bg --cdp --fast-triage # Skip detail fetch for obvious title rejects
+python main.py --site jobs.bg --cdp --current-tab # Continue from an open search/detail tab
+python main.py --site jobs.bg --cdp --job-url URL # Process one jobs.bg detail URL
 
 # ─── Common Options ───────────────────────────
 python main.py --profile my_resume.pdf            # Custom PDF profile
@@ -184,6 +186,8 @@ python tests/demo_scrape.py
 | `--cdp` | Attach to a running, human-cleared browser over CDP (jobs.bg / DataDome bypass) | Off |
 | `--cdp-endpoint URL` | CDP endpoint to attach to | `http://127.0.0.1:9222` |
 | `--fast-triage` | jobs.bg only: skip full detail fetch for explicit title hard-deny rejects; ambiguous listings still fetch details | Off |
+| `--current-tab` | jobs.bg + `--cdp`: process the currently reused jobs.bg search-results or detail tab instead of keyword/location search | Off |
+| `--job-url URL` | jobs.bg + `--cdp`: process one job detail URL instead of keyword/location search | Off |
 | `--verbose` | Debug logging | Off |
 
 ## Configuration
