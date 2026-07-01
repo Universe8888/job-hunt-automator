@@ -14,6 +14,7 @@ import os
 import re
 import logging
 from collections import defaultdict
+from typing import Any
 
 from config import PROFILE_PDF, SKILL_WEIGHTS, MATCH_THRESHOLD
 
@@ -24,10 +25,12 @@ def extract_pdf_text(filepath: str) -> str:
     """Extract all text from a PDF file using PyPDF2, falling back to pypdf."""
     try:
         try:
-            from PyPDF2 import PdfReader
+            from PyPDF2 import PdfReader as PyPDF2Reader
+            reader_cls: Any = PyPDF2Reader
         except ImportError:
-            from pypdf import PdfReader
-        reader = PdfReader(filepath)
+            from pypdf import PdfReader as PypdfReader
+            reader_cls = PypdfReader
+        reader = reader_cls(filepath)
         text_parts = []
         for page in reader.pages:
             page_text = page.extract_text()
