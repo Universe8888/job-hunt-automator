@@ -321,7 +321,12 @@ def parse_jobsbg_cards(html: str) -> list[dict]:
                 job["company"] = company_fallback.get_text(strip=True)
 
         # Date extraction (bs4 4.x: use string=, not the deprecated text=).
-        time_el = card.find("div", class_="secondary-text", string=re.compile(r"\d{2}\.\d{2}\.\d{4}"))
+        date_pattern = re.compile(r"\d{2}\.\d{2}\.\d{4}")
+        time_el = None
+        for candidate in card.select("div.secondary-text"):
+            if date_pattern.search(candidate.get_text(strip=True)):
+                time_el = candidate
+                break
         if not time_el:
             # Fallback for relative dates like "today" or "yesterday"
             time_el = card.find("div", class_="secondary-text")

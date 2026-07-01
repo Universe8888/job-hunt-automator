@@ -111,6 +111,7 @@ python main.py --days 7 --max-jobs 50             # Past week, limit 50
 python main.py --site jobs.bg                     # Scrape Jobs.bg (headed, recommended)
 python main.py --site jobs.bg --max-jobs 100      # Limit to 100 jobs
 python main.py --site jobs.bg --cdp --days 7      # Attach to your cleared browser (DataDome bypass)
+python main.py --site jobs.bg --cdp --fast-triage # Skip detail fetch for obvious title rejects
 
 # ─── Common Options ───────────────────────────
 python main.py --profile my_resume.pdf            # Custom PDF profile
@@ -182,6 +183,7 @@ python tests/demo_scrape.py
 | `--cookies FILE` | Path to a JSON cookie file for authenticated scraping | `linkedin_cookies.json` |
 | `--cdp` | Attach to a running, human-cleared browser over CDP (jobs.bg / DataDome bypass) | Off |
 | `--cdp-endpoint URL` | CDP endpoint to attach to | `http://127.0.0.1:9222` |
+| `--fast-triage` | jobs.bg only: skip full detail fetch for explicit title hard-deny rejects; ambiguous listings still fetch details | Off |
 | `--verbose` | Debug logging | Off |
 
 ## Configuration
@@ -266,6 +268,8 @@ python main.py --site jobs.bg --cdp --days 7
 How it works: the scraper connects over the Chrome DevTools Protocol, **reuses your existing browser context** (inheriting the DataDome clearance cookie), and runs the search + description fetches through it. It opens its own tab (and cleans it up afterwards) without touching your other tabs.
 
 **Pacing:** sustained machine-speed requests will make DataDome re-challenge even a cleared session. `--cdp` mode therefore paces each fetch with a randomised delay plus a periodic longer pause (tunable via the `CDP_*` knobs in `config.py`). Expect roughly 20–30s per job — deliberately human.
+
+**Fast triage:** add `--fast-triage` to avoid opening detail pages for jobs.bg cards whose title alone matches an explicit Gate 1 operator-title hard deny. These rows still go to the rejects CSV with an audit reason; titles with no clear signal still fetch details so body text can rescue real AI-governance roles.
 
 > **Note:** This is a *personal, small-scale* technique for scraping data you can already see in your own browser. Respect jobs.bg's Terms of Service and keep volumes low.
 

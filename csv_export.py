@@ -116,6 +116,38 @@ def load_existing_urls(filepath: str) -> set[str]:
     return urls
 
 
+def remove_url_from_csv(filepath: str, url: str) -> int:
+    """Remove rows for ``url`` from a CSV while preserving its existing columns."""
+    target = (url or "").strip()
+    if not target or not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        return 0
+
+    try:
+        with open(filepath, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            columns = reader.fieldnames or []
+            rows = list(reader)
+
+        if "Job URL" not in columns:
+            return 0
+
+        kept_rows = [row for row in rows if row.get("Job URL", "").strip() != target]
+        removed = len(rows) - len(kept_rows)
+        if removed == 0:
+            return 0
+
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(kept_rows)
+
+        logger.info("Removed %d stale row(s) for %s from %s", removed, target, filepath)
+        return removed
+    except Exception as e:
+        logger.warning("⚠️  Failed to remove stale URL from %s: %s", filepath, str(e))
+        return 0
+
+
 def _has_valid_header(filepath: str, expected_first_col: str) -> bool:
     """Check if the CSV file starts with the expected header column."""
     try:

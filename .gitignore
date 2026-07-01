@@ -112,6 +112,7 @@ coverage.xml
 # ──────────────────────────────────────────────
 .local/
 CLAUDE.local.md
+AGENTS.md
 # Brainstorming/spec docs reference the private .local strategy — keep out of the
 # public repo. (Scoped to this subtree, not all of docs/, so public docs can live
 # elsewhere under docs/ later.)

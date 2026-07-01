@@ -21,9 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 def extract_pdf_text(filepath: str) -> str:
-    """Extract all text from a PDF file using PyPDF2."""
+    """Extract all text from a PDF file using PyPDF2, falling back to pypdf."""
     try:
-        from PyPDF2 import PdfReader
+        try:
+            from PyPDF2 import PdfReader
+        except ImportError:
+            from pypdf import PdfReader
         reader = PdfReader(filepath)
         text_parts = []
         for page in reader.pages:

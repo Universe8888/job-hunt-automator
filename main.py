@@ -36,7 +36,13 @@ from typing import Any
 from config import KEYWORDS, LOCATIONS, PROFILE_PDF, OUTPUT_CSV, MAX_JOBS_PER_RUN, TARGET_SITE, LEADS_CSV, REJECTS_CSV
 from stealth_config import get_launch_options, get_context_options, get_random_user_agent, apply_stealth_to_page
 from scraper import human_delay
-from csv_export import export_to_csv, export_rejects_csv, sort_leads_csv
+from csv_export import (
+    export_to_csv,
+    export_rejects_csv,
+    sort_leads_csv,
+    load_existing_urls,
+    remove_url_from_csv,
+)
 from profile_matcher import match_jobs, load_skills
 
 import gatekeeper
@@ -159,6 +165,12 @@ BANNER = r"""
 ╚══════════════════════════════════════════════════════╝
 """
 
+FAST_TRIAGE_AUDIT_REASON = (
+    "FAST_TRIAGE: skipped jobs.bg detail fetch because the title matched an "
+    "explicit Gate 1 operator-title hard deny"
+)
+FAST_BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
+
 
 # ────────────────────────────────────────
 # Date Filter Mapping
@@ -247,6 +259,10 @@ class BrowserSession:
     @property
     def context(self):
         return self._context
+
+    @property
+    def owns_page(self) -> bool:
+        return True
 
     async def ensure_alive(self) -> bool:
         """
@@ -355,7 +371,141 @@ def _attach_verdict(job: dict) -> str:
     return verdict.verdict
 
 
-def _route_job(job: dict, leads_csv: str, rejects_csv: str) -> tuple[str, int]:
+def _fast_triage_reject_reason(job: dict, enabled: bool, is_jobsbg: bool) -> str | None:
+    """
+    Conservative pre-detail jobs.bg triage.
+
+    Safe rule only: skip the expensive detail page when the TITLE alone hits the
+    explicit Gate 1 title-hard-deny path. A title with merely no lane terms is
+    NOT skipped because the detail body may contain the in-lane signal.
+    """
+    if not enabled or not is_jobsbg:
+        return None
+
+    title = (job.get("title") or "").strip()
+    if not title:
+        return None
+
+    if not gatekeeper.title_hard_deny_hits(title):
+        return None
+    return FAST_TRIAGE_AUDIT_REASON
+
+
+async def _enable_fast_resource_blocking(
+    page: Any,
+    blocked_page_ids: set[int],
+    blocked_resource_counts: dict[str, int],
+    logger: logging.Logger,
+) -> bool:
+    """Block non-essential resources on a page we own.
+
+    We only abort images/fonts/media: scripts and styles stay enabled so DataDome
+    and page DOM rendering are not starved. The page-id guard prevents stacking
+    duplicate route handlers on the same Playwright page.
+    """
+    page_id = id(page)
+    if page_id in blocked_page_ids:
+        return False
+
+    async def _route_handler(route):
+        try:
+            resource_type = route.request.resource_type
+            if resource_type in FAST_BLOCKED_RESOURCE_TYPES:
+                blocked_resource_counts[resource_type] = (
+                    blocked_resource_counts.get(resource_type, 0) + 1
+                )
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    try:
+        await page.route("**/*", _route_handler)
+        blocked_page_ids.add(page_id)
+        logger.info("  🚫 Fast triage: blocking image/font/media requests on scraper-owned tab")
+        return True
+    except Exception as e:
+        logger.debug("  ⚠️  Could not enable fast resource blocking: %s", str(e)[:100])
+        return False
+
+
+async def _maybe_enable_fast_resource_blocking(
+    page: Any,
+    session: Any,
+    *,
+    fast_triage: bool,
+    is_jobsbg: bool,
+    use_cdp: bool,
+    blocked_page_ids: set[int],
+    blocked_resource_counts: dict[str, int],
+    logger: logging.Logger,
+) -> bool:
+    if not fast_triage or not is_jobsbg:
+        return False
+    if use_cdp and not getattr(session, "owns_page", False):
+        logger.debug("  🚫 Fast triage: not blocking resources on a reused human CDP tab")
+        return False
+    return await _enable_fast_resource_blocking(page, blocked_page_ids, blocked_resource_counts, logger)
+
+
+def _log_timing_summary(
+    logger: logging.Logger,
+    *,
+    total_jobs: int,
+    elapsed: float,
+    search_time: float,
+    desc_time: float,
+    cdp_pace_time: float,
+    non_cdp_pace_time: float,
+    gate_route_time: float,
+    sort_time: float,
+    duplicate_skips: int,
+    fast_triage_skips: int,
+    blocked_resource_counts: dict[str, int] | None = None,
+) -> None:
+    logger.info("  Jobs routed this run: %d", total_jobs)
+    logger.info("  Time elapsed:         %.1f minutes", elapsed / 60)
+    logger.info("  ├─ Search phase:            %.1f minutes", search_time / 60)
+    logger.info("  ├─ Detail nav/extract:      %.1f minutes", desc_time / 60)
+    logger.info("  ├─ CDP pacing sleep:        %.1f minutes", cdp_pace_time / 60)
+    logger.info("  ├─ Non-CDP post-fetch wait: %.1f minutes", non_cdp_pace_time / 60)
+    logger.info("  ├─ Gate/route/write:        %.1f minutes", gate_route_time / 60)
+    logger.info("  └─ Final leads sort:        %.1f minutes", sort_time / 60)
+    logger.info("  Duplicate skips before detail fetch: %d", duplicate_skips)
+    logger.info("  Fast-triage detail skips:          %d", fast_triage_skips)
+    if blocked_resource_counts:
+        blocked = ", ".join(
+            f"{resource_type}={count}" for resource_type, count in sorted(blocked_resource_counts.items())
+        )
+        logger.info("  Fast-triage blocked requests:      %s", blocked)
+
+
+def _load_detail_skip_state(
+    leads_csv: str,
+    rejects_csv: str,
+    logger: logging.Logger,
+) -> tuple[set[str], set[str]]:
+    """Return URLs safe to skip before detail fetch and old rejects to recheck."""
+    lead_urls = load_existing_urls(leads_csv)
+    reject_urls = load_existing_urls(rejects_csv)
+    logger.info(
+        "📋 Pre-loaded %d lead URLs for pre-detail skip; %d reject URLs will be rechecked",
+        len(lead_urls),
+        len(reject_urls),
+    )
+    return set(lead_urls), set(reject_urls)
+
+
+def _route_job(
+    job: dict,
+    leads_csv: str,
+    rejects_csv: str,
+    stale_reject_urls: set[str] | None = None,
+) -> tuple[str, int]:
     """
     Route a fully-evaluated job to the correct CSV (real-time saving):
       verdict in {keep, manual_review} -> leads CSV  (export_to_csv)
@@ -370,7 +520,29 @@ def _route_job(job: dict, leads_csv: str, rejects_csv: str) -> tuple[str, int]:
         # Incremental save: skip the per-row rank sort (O(n^2) over a run); the
         # leads CSV is sorted once at the end of the run via sort_leads_csv().
         new_count = export_to_csv([job], leads_csv, sort_after=False)
+        url = job.get("url", "").strip()
+        if new_count > 0 and stale_reject_urls is not None and url in stale_reject_urls:
+            remove_url_from_csv(rejects_csv, url)
+            stale_reject_urls.discard(url)
     return verdict, new_count
+
+
+def _route_fast_triage_reject(
+    job: dict,
+    *,
+    skills: dict[str, float],
+    leads_csv: str,
+    rejects_csv: str,
+    fast_triage_reason: str,
+) -> tuple[str, int]:
+    """Attach title-only verdict fields and write a fast-triaged reject."""
+    job.setdefault("description", "")
+    match_jobs([job], skills=skills)
+    _attach_verdict(job)
+    job["gate_reasons"] = "; ".join(
+        filter(None, [job.get("gate_reasons", ""), fast_triage_reason])
+    )
+    return _route_job(job, leads_csv, rejects_csv)
 
 
 # ────────────────────────────────────────
@@ -401,6 +573,7 @@ async def run(args):
     fetch_descriptions = not args.quick
     headless = args.headless
     max_jobs = args.max_jobs or MAX_JOBS_PER_RUN
+    fast_triage = bool(getattr(args, "fast_triage", False))
 
     selected_site = args.site if args.site else TARGET_SITE
 
@@ -445,6 +618,7 @@ async def run(args):
     logger.info("   Locations: %s", [loc["name"] for loc in LOCATIONS])
     logger.info("   Work types: Remote + Hybrid")
     logger.info("   Fetch descriptions: %s (Real-Time)", fetch_descriptions)
+    logger.info("   Fast triage: %s", fast_triage if is_jobsbg else "off (jobs.bg only)")
     logger.info("   Target Site: %s", selected_site)
     logger.info("   Profile PDF: %s", profile_pdf)
     logger.info("   Leads CSV (keep + manual_review):   %s", leads_csv)
@@ -461,10 +635,20 @@ async def run(args):
     # ── Load skills ONCE ─────────────────────────
     skills = load_skills(profile_pdf)
 
+    # ── Pre-load leads only for pre-detail skips. Existing rejects are rechecked
+    #    so gate/config fixes can promote them on later runs.
+    seen_urls, stale_reject_urls = _load_detail_skip_state(leads_csv, rejects_csv, logger)
+
     all_jobs = []
-    start_time = time.time()
+    start_time = time.perf_counter()
     search_time = 0.0
     desc_time = 0.0
+    cdp_pace_time = 0.0
+    non_cdp_pace_time = 0.0
+    gate_route_time = 0.0
+    sort_time = 0.0
+    duplicate_skips = 0
+    fast_triage_skips = 0
     hit_max = False
 
     # Launch browser with stealth
@@ -472,6 +656,8 @@ async def run(args):
     from playwright_stealth import Stealth
 
     use_cdp = getattr(args, "cdp", False)
+    resource_blocked_pages: set[int] = set()
+    blocked_resource_counts: dict[str, int] = {}
 
     async with Stealth().use_async(async_playwright()) as p:
         if use_cdp:
@@ -480,9 +666,29 @@ async def run(args):
             session = await CDPSession(p, endpoint=getattr(args, "cdp_endpoint", CDP_DEFAULT_ENDPOINT)).start()
             page = session.page
             logger.info("🔌 CDP mode — scraping through your cleared browser session.")
+            await _maybe_enable_fast_resource_blocking(
+                page,
+                session,
+                fast_triage=fast_triage,
+                is_jobsbg=is_jobsbg,
+                use_cdp=use_cdp,
+                blocked_page_ids=resource_blocked_pages,
+                blocked_resource_counts=blocked_resource_counts,
+                logger=logger,
+            )
         else:
             session = await BrowserSession(p, headless=headless, cookies=cookies).start()
             page = session.page
+            await _maybe_enable_fast_resource_blocking(
+                page,
+                session,
+                fast_triage=fast_triage,
+                is_jobsbg=is_jobsbg,
+                use_cdp=use_cdp,
+                blocked_page_ids=resource_blocked_pages,
+                blocked_resource_counts=blocked_resource_counts,
+                logger=logger,
+            )
 
             # Warm up: visit target site homepage first (looks more natural)
             home_url = "https://www.linkedin.com/" if selected_site == "linkedin" else "https://www.jobs.bg/en/"
@@ -511,15 +717,25 @@ async def run(args):
                 # Ensure browser is alive before each search
                 await session.ensure_alive()
                 page = session.page
+                await _maybe_enable_fast_resource_blocking(
+                    page,
+                    session,
+                    fast_triage=fast_triage,
+                    is_jobsbg=is_jobsbg,
+                    use_cdp=use_cdp,
+                    blocked_page_ids=resource_blocked_pages,
+                    blocked_resource_counts=blocked_resource_counts,
+                    logger=logger,
+                )
 
                 # Fetch basic jobs (no descriptions yet)
-                t0 = time.time()
+                t0 = time.perf_counter()
                 basic_jobs = await active_scraper.scrape_jobs(
                     page, keyword, location,
                     fetch_descriptions=False,
                     date_filter=date_filter,
                 )
-                search_time += time.time() - t0
+                search_time += time.perf_counter() - t0
 
                 if basic_jobs:
                     logger.info("  📖 Found %d jobs — fetching descriptions and matching…", len(basic_jobs))
@@ -542,6 +758,21 @@ async def run(args):
                             hit_max = True
                             break
 
+                        # Skip jobs already saved as leads, plus same-run repeats.
+                        # Existing rejects are intentionally rechecked so gate/config
+                        # fixes can promote them instead of freezing old decisions.
+                        job_url = job.get("url", "").strip()
+                        if job_url and job_url in seen_urls:
+                            duplicate_skips += 1
+                            if not HAS_TQDM:
+                                logger.info(
+                                    "    [%d/%d] ⏭  duplicate skipped: %s",
+                                    i + 1,
+                                    len(basic_jobs),
+                                    job.get("title", "Unknown"),
+                                )
+                            continue
+
                         if not HAS_TQDM:
                             logger.info("    [%d/%d] %s", i + 1, len(basic_jobs), job.get("title", "Unknown"))
 
@@ -549,9 +780,45 @@ async def run(args):
                         recovered = await session.ensure_alive()
                         if recovered:
                             page = session.page
+                            await _maybe_enable_fast_resource_blocking(
+                                page,
+                                session,
+                                fast_triage=fast_triage,
+                                is_jobsbg=is_jobsbg,
+                                use_cdp=use_cdp,
+                                blocked_page_ids=resource_blocked_pages,
+                                blocked_resource_counts=blocked_resource_counts,
+                                logger=logger,
+                            )
+
+                        fast_triage_reason = _fast_triage_reject_reason(
+                            job,
+                            enabled=fast_triage and fetch_descriptions,
+                            is_jobsbg=is_jobsbg,
+                        )
+                        if fast_triage_reason:
+                            t0 = time.perf_counter()
+                            verdict, new_count = _route_fast_triage_reject(
+                                job,
+                                skills=skills,
+                                leads_csv=leads_csv,
+                                rejects_csv=rejects_csv,
+                                fast_triage_reason=fast_triage_reason,
+                            )
+                            gate_route_time += time.perf_counter() - t0
+
+                            if job_url:
+                                seen_urls.add(job_url)
+
+                            all_jobs.append(job)
+                            fast_triage_skips += 1
+                            if not HAS_TQDM:
+                                dest = rejects_csv if verdict == "reject" else leads_csv
+                                logger.info("      → %s | fast-triage saved to %s", verdict, dest)
+                            continue
 
                         if fetch_descriptions and job.get("url"):
-                            t0 = time.time()
+                            t0 = time.perf_counter()
                             if is_jobsbg:
                                 # jobs.bg fetcher also fills job['location'] from the
                                 # detail-page DOM when blank (USER DECISION #3 — feeds
@@ -563,17 +830,22 @@ async def run(args):
                                 job["description"] = await active_scraper.fetch_job_description(
                                     page, job["url"]
                                 )
-                            desc_time += time.time() - t0
+                            desc_time += time.perf_counter() - t0
                             # CDP mode rides a human-cleared DataDome session; pace
                             # like a human to avoid a re-challenge. Other modes keep
                             # the original fast cadence.
                             if use_cdp:
+                                t0 = time.perf_counter()
                                 await cdp_human_pace(i)
+                                cdp_pace_time += time.perf_counter() - t0
                             else:
+                                t0 = time.perf_counter()
                                 await human_delay(2, 5)
+                                non_cdp_pace_time += time.perf_counter() - t0
                         else:
                             job.setdefault("description", "")
 
+                        t0 = time.perf_counter()
                         # 1) INFO scoring (legacy skill match — never gates).
                         match_jobs([job], skills=skills)
 
@@ -582,7 +854,17 @@ async def run(args):
 
                         # 3) Route + save immediately (Real-Time Saving):
                         #    keep|manual_review -> leads; reject -> rejects audit CSV.
-                        verdict, new_count = _route_job(job, leads_csv, rejects_csv)
+                        verdict, new_count = _route_job(
+                            job,
+                            leads_csv,
+                            rejects_csv,
+                            stale_reject_urls=stale_reject_urls,
+                        )
+                        gate_route_time += time.perf_counter() - t0
+
+                        # Track in seen_urls so later keyword combos skip it instantly.
+                        if job_url:
+                            seen_urls.add(job_url)
 
                         all_jobs.append(job)
                         if not HAS_TQDM:
@@ -601,23 +883,42 @@ async def run(args):
 
         await session.close()
 
-    elapsed = time.time() - start_time
+    if all_jobs:
+        t0 = time.perf_counter()
+        # Single final rank sort (rows were written with sort_after=False to avoid an
+        # O(n^2) per-row rewrite during incremental saving).
+        sort_leads_csv(leads_csv)
+        sort_time = time.perf_counter() - t0
+
+    elapsed = time.perf_counter() - start_time
     logger.info("")
     logger.info("═" * 60)
     logger.info("  SCRAPING COMPLETE")
     logger.info("═" * 60)
-    logger.info("  Total jobs found:     %d", len(all_jobs))
-    logger.info("  Time elapsed:         %.1f minutes", elapsed / 60)
-    logger.info("  ├─ Search phase:      %.1f minutes", search_time / 60)
-    logger.info("  └─ Description phase: %.1f minutes", desc_time / 60)
+    _log_timing_summary(
+        logger,
+        total_jobs=len(all_jobs),
+        elapsed=elapsed,
+        search_time=search_time,
+        desc_time=desc_time,
+        cdp_pace_time=cdp_pace_time,
+        non_cdp_pace_time=non_cdp_pace_time,
+        gate_route_time=gate_route_time,
+        sort_time=sort_time,
+        duplicate_skips=duplicate_skips,
+        fast_triage_skips=fast_triage_skips,
+        blocked_resource_counts=blocked_resource_counts,
+    )
 
     if not all_jobs:
-        logger.warning("⚠️  No jobs were found in this run.")
+        if duplicate_skips:
+            logger.warning(
+                "⚠️  No new jobs were routed; %d already-known URL(s) skipped before detail fetch.",
+                duplicate_skips,
+            )
+        else:
+            logger.warning("⚠️  No jobs were found in this run.")
         return
-
-    # Single final rank sort (rows were written with sort_after=False to avoid an
-    # O(n^2) per-row rewrite during incremental saving).
-    sort_leads_csv(leads_csv)
 
     # ── Verdict-based summary (the 3 gates decide the verdict, not the score) ──
     keeps = [j for j in all_jobs if j.get("verdict") == "keep"]
@@ -688,6 +989,7 @@ Examples:
   python main.py --headless                      # Run without visible browser
   python main.py --days 7                        # Only jobs from past week
   python main.py --max-jobs 50                   # Stop after 50 jobs
+  python main.py --site jobs.bg --fast-triage    # Skip detail fetch for obvious title rejects
   python main.py --verbose                       # Debug logging
   python main.py --login                         # One-time login (⚠️ RISK)
   python main.py --cookies my_cookies.json       # Use custom cookie file
@@ -702,6 +1004,9 @@ Examples:
                         help="Only show jobs posted within N days (1, 7, or 30)")
     parser.add_argument("--max-jobs", type=int, default=0,
                         help="Maximum total jobs to collect (0 = unlimited)")
+    parser.add_argument("--fast-triage", action="store_true",
+                        help="jobs.bg only: skip full detail fetch for explicit title hard-deny rejects, "
+                             "and use light resource blocking on scraper-owned tabs. Default behavior is unchanged.")
     parser.add_argument("--site", type=str, choices=["linkedin", "jobs.bg"],
                         help="Select the target site to scrape (linkedin or jobs.bg)")
     parser.add_argument("--output", type=str, help="Override output CSV filename")

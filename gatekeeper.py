@@ -184,6 +184,25 @@ def passes_lane_gate(job: dict) -> GateResult:
     return _lane_core(job.get("title", ""), job.get("description", ""))
 
 
+def title_hard_deny_hits(title: str) -> list[str]:
+    """Explicit title-level operator denies after the lane-title override.
+
+    Used by jobs.bg fast triage before opening detail pages. A title hard-deny is
+    safe to reject pre-detail only when the title itself does NOT also carry a
+    lane-allow term; that mirrors Stage A in _lane_core().
+    """
+    nt = _norm_lane(title)
+    if not nt:
+        return []
+    title_denies = [t for t, rx in _compiled(TITLE_HARD_DENY) if rx.search(nt)]
+    if not title_denies:
+        return []
+    title_allow_hits = [t for t, rx in _compiled(LANE_ALLOW) if rx.search(nt)]
+    if title_allow_hits:
+        return []
+    return title_denies
+
+
 def _lane_core(title: str, body: str) -> GateResult:
     nt = _norm_lane(title)
     nb = _norm_lane(body)
@@ -198,8 +217,9 @@ def _lane_core(title: str, body: str) -> GateResult:
     # lane scan) if the title ALSO carries a LANE_ALLOW phrase, so genuinely
     # in-lane titles with an embedded operator token survive to Stage B.
     title_allow_hits = [t for t, rx in _compiled(LANE_ALLOW) if rx.search(nt)]
-    if title_denies and not title_allow_hits:
-        reasons.append(f"GATE1 hard_fail: operator title matched {title_denies}")
+    explicit_title_denies = title_hard_deny_hits(title)
+    if explicit_title_denies:
+        reasons.append(f"GATE1 hard_fail: operator title matched {explicit_title_denies}")
         return GateResult(status="hard_fail", signal=0.0, reasons=reasons)
     if title_denies and title_allow_hits:
         reasons.append(

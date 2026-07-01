@@ -1,3 +1,7 @@
+import builtins
+import sys
+from types import ModuleType
+
 import pytest
 from profile_matcher import extract_skills_from_profile, score_job, match_jobs
 import config
@@ -38,6 +42,37 @@ def test_extract_skills_from_profile_adds_certifications(override_config):
     assert "iso 27001" in skills
     assert skills["itil"] == 0.6
     assert skills["iso 27001"] == 0.6
+
+
+def test_extract_pdf_text_falls_back_to_pypdf_when_pypdf2_missing(monkeypatch):
+    """Local Python may have pypdf but not PyPDF2; profile PDFs should still load."""
+    import profile_matcher
+
+    class FakePage:
+        def extract_text(self):
+            return "AI governance and software asset management"
+
+    class FakeReader:
+        def __init__(self, filepath):
+            assert filepath == "my_resume.pdf"
+            self.pages = [FakePage()]
+
+    fake_pypdf = ModuleType("pypdf")
+    fake_pypdf.PdfReader = FakeReader
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "PyPDF2":
+            raise ImportError("PyPDF2 intentionally unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert profile_matcher.extract_pdf_text("my_resume.pdf") == (
+        "AI governance and software asset management"
+    )
 
 
 def test_score_job_perfect_match(override_config):

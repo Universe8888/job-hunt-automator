@@ -184,6 +184,21 @@ def test_lane_fix1_ai_gov_business_analyst_survives(override_config):
     assert res.signal >= 2.0
 
 
+def test_title_hard_deny_hits_returns_explicit_operator_title(override_config):
+    """A4b: pre-detail triage can safely identify explicit title hard-denies."""
+    assert gatekeeper.title_hard_deny_hits("Inventory Specialist") == ["inventory specialist"]
+
+
+def test_title_hard_deny_hits_ignores_no_signal_title(override_config):
+    """A4c: no-signal titles must still fetch detail text before final verdict."""
+    assert gatekeeper.title_hard_deny_hits("Business Analyst") == []
+
+
+def test_title_hard_deny_hits_respects_lane_allow_override(override_config):
+    """A4d: title deny is not explicit when the title itself contains lane signal."""
+    assert gatekeeper.title_hard_deny_hits("Generic Business Analyst, AI Governance") == []
+
+
 def test_lane_hits_counts_distinct_word_boundary_case_insensitive(override_config):
     """A5: distinct-count (not occurrence-count), case-insensitive, word-boundary."""
     job = J(title="AI GOVERNANCE Lead",
@@ -225,6 +240,30 @@ def test_lane_lone_weak_term_is_soft_not_pass(override_config):
     res = passes_lane_gate(job)
     assert res.status == "soft"
     assert "only weak lane term" in _reasons_text(res)
+
+
+def test_lane_lone_weak_term_with_operator_signal_stays_soft(override_config, monkeypatch):
+    """A8b: weak body-only evidence plus operator context stays in manual review."""
+    monkeypatch.setattr(
+        gatekeeper,
+        "LANE_DENY",
+        MOCK_LANE_DENY + ["customer support", "call center", "client solutions consultant"],
+    )
+    monkeypatch.setattr(gatekeeper, "LANE_ALLOW", MOCK_LANE_ALLOW + ["automation"])
+    monkeypatch.setattr(gatekeeper, "LANE_ALLOW_WEAK", MOCK_LANE_ALLOW_WEAK + ["automation"])
+    job = J(
+        title="Client Solutions Consultant with German and English",
+        description=(
+            "Customer support in a call center environment. Continuous optimization "
+            "of our processes through the automation of individual work steps."
+        ),
+    )
+
+    res = passes_lane_gate(job)
+
+    assert res.status == "soft"
+    assert "only weak lane term" in _reasons_text(res)
+    assert "operator-lane signal" in _reasons_text(res)
 
 
 def test_lane_two_weak_terms_pass(override_config):

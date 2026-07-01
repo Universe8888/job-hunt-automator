@@ -23,6 +23,7 @@ class TestBuildJobsbgSearchUrl:
         assert "https://www.jobs.bg/en/front_job_search.php" in url
         assert "keywords%5B%5D=Python+Developer" in url or "keywords[]=Python+Developer" in url.replace("%5B%5D", "[]")
         assert "subm=1" in url
+        assert "is_home_based=1" not in url
 
     def test_with_location_id(self):
         url = build_jobsbg_search_url("Python Developer", SAMPLE_LOCATION)

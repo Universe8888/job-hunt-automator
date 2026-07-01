@@ -6,7 +6,13 @@ import tempfile
 
 import pytest
 
-from csv_export import export_to_csv, load_existing_urls, _truncate_description, CSV_COLUMNS
+from csv_export import (
+    export_to_csv,
+    load_existing_urls,
+    remove_url_from_csv,
+    _truncate_description,
+    CSV_COLUMNS,
+)
 
 
 @pytest.fixture
@@ -94,6 +100,23 @@ class TestLoadExistingUrls:
 
         urls = load_existing_urls(temp_csv_path)
         assert urls == set()
+
+
+class TestRemoveUrlFromCsv:
+    def test_removes_matching_url_and_preserves_other_rows(self, temp_csv_path):
+        with open(temp_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerow({"Job Title": "Old", "Job URL": "https://example.com/old"})
+            writer.writerow({"Job Title": "Keep", "Job URL": "https://example.com/keep"})
+
+        removed = remove_url_from_csv(temp_csv_path, "https://example.com/old")
+
+        assert removed == 1
+        with open(temp_csv_path, "r", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        assert [row["Job URL"] for row in rows] == ["https://example.com/keep"]
+        assert rows[0]["Job Title"] == "Keep"
 
 
 class TestExportToCsv:

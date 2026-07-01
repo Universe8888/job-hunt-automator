@@ -110,6 +110,11 @@ class CDPSession:
     def context(self):
         return self._context
 
+    @property
+    def owns_page(self) -> bool:
+        """True when the active page was opened by this scraper session."""
+        return self._opened_own_tab
+
     async def ensure_alive(self) -> bool:
         """Match BrowserSession.ensure_alive — verify the attached page still responds."""
         try:
