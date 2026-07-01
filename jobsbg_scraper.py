@@ -37,9 +37,33 @@ _GEO_TOWN_TOKENS = (
 )
 _GEO_REMOTE_PHRASES = (
     "fully remote work", "fully remote", "remote work", "remote position",
-    "work from home", "home office", "hybrid", "дистанционна работа",
-    "изцяло дистанционно", "home-based",
+    "remote", "дистанционно", "work from home", "home office", "hybrid",
+    "дистанционна работа", "изцяло дистанционно", "home-based",
 )
+# Single ambiguous tokens matched STANDALONE only: the token, then end-of-string or
+# a non-word char that is NOT a hyphen — so 'Remote', 'Remote (CET team)', 'Hybrid,
+# Sofia' pass, while compounds/derivatives ('remotely', 'remote sensing',
+# 'remote-controlled', 'hybrid car parts') do NOT. A following space+word or hyphen
+# means the token modifies a noun (a compound), not a standalone work-arrangement tag.
+_GEO_REMOTE_STANDALONE = {
+    tok: re.compile(r"\b" + re.escape(tok) + r"(?![\w\- ]*\w)", re.IGNORECASE)
+    for tok in ("remote", "hybrid", "дистанционно")
+}
+
+
+def _geo_remote_hit(low: str) -> bool:
+    """True if a remote/hybrid phrase is present. Single ambiguous tokens
+    ('remote'/'hybrid'/'дистанционно') must be STANDALONE (not part of a longer
+    remote-*/hybrid-* compound or the adverb 'remotely'); multi-word phrases
+    ('work from home', 'fully remote') match as substrings — no homograph risk."""
+    for ph in _GEO_REMOTE_PHRASES:
+        rx = _GEO_REMOTE_STANDALONE.get(ph)
+        if rx is not None:
+            if rx.search(low):
+                return True
+        elif ph in low:
+            return True
+    return False
 # False friends: spans that CONTAIN a geo word but do NOT describe the work
 # location. 'Remote interview' is a hiring-process note, not a remote job.
 _GEO_TRAP_PHRASES = (
@@ -55,8 +79,23 @@ _GEO_TRAP_PHRASES = (
 # stress-test (2026-06-30) showed 'Akkodis Bulgaria EOOD - Sofia office' and
 # leading 'Ad Astra Bulgaria' / 'ЕАД Русе' slipping through an end-anchored regex.
 _GEO_COMPANY_PREFIXES = ("jobs of", "it jobs of")
-_GEO_ENTITY_SUFFIX = re.compile(
-    r"\b(?:eood|ood|ead|ad|jsc|ltd|llc|gmbh|gbr|ag|srl|sa|еоод|оод|еад|ад)\b\.?",
+# Legal-entity tokens come in two safety classes:
+#   - UNAMBIGUOUS (>=3 chars / clearly corporate): may appear anywhere in the span.
+#   - AMBIGUOUS short tokens (ad/sa/ag/od and their Cyrillic forms) collide with
+#     ordinary words ("ad-tech district", "AG campus") — they mark a company ONLY
+#     in a company-NAME POSITION: the FIRST or LAST token of the span ("Ad Astra
+#     Bulgaria", "...Bulgaria EAD", "ЕАД Русе"). A mid-string occurrence is treated
+#     as incidental text and kept, which removes the false-drops the audit found.
+_GEO_ENTITY_ANY = re.compile(
+    r"\b(?:eood|jsc|ltd|llc|gmbh|gbr|srl|еоод|оод|еад)\b\.?",
+    re.IGNORECASE | re.UNICODE,
+)
+# Ambiguous short entity token in company-NAME position. Leading form requires the
+# token to be a STANDALONE word (followed by whitespace, not a hyphen) so a
+# hyphenated compound ('ad-tech', 'ag-grid') is NOT treated as a company token;
+# trailing form is the legal suffix at end-of-string ('...Bulgaria EAD').
+_GEO_ENTITY_EDGE = re.compile(
+    r"(?:^(?:ood|ead|ad|ag|sa|ад)(?=\s)|\b(?:ood|ead|ad|ag|sa|ад)\.?\s*$)",
     re.IGNORECASE | re.UNICODE,
 )
 # Negation / on-site markers that DISQUALIFY a remote phrase ('No remote work —
@@ -65,17 +104,79 @@ _GEO_REMOTE_NEGATORS = (
     "no remote", "not remote", "without remote", "on-site", "onsite",
     "on site", "strictly", "no home office", "no work from home",
 )
-# Prose / job-duty markers: a span containing one of these is describing a DUTY
-# or sentence, not labelling a location ('Provide remote support to our Varna
-# team', 'You will relocate to Plovdiv', 'Hybrid car parts warehouse').
-_GEO_PROSE_MARKERS = (
-    "will", "provide", "support for", "support to", "relocate", "located in",
-    "welcome", "possible", "covered", "festival", "warehouse", "team",
-    "clients", "опит", "near",
+# Region/hub tokens that make a geo span DENY-SCOPED (US / NAMER / APAC / LATAM). A
+# small, CLOSED set of region NAMES (not open-ended like salary numbers — so a regex
+# is acceptable here where it was not for comp). When a remote/town span ALSO carries
+# one of these, it is allow-able only as a LAST RESORT, ranking below any clean
+# (deny-free) sibling.
+#
+# 'us'/'usa' are NEVER matched as a bare word (R2 audit: a bare \bus\b matched the
+# English PRONOUN in 'Join us in Sofia' / 'work with us', demoting a clean BG-town span
+# and discarding a real lead). They count as a region ONLY in unambiguous region
+# position: parenthesized '(US)', dotted 'U.S.', a 'US-based / US remote / US only'
+# compound, or after a region preposition ('within/based in/located in/… (the) US').
+# Verb-object pronoun forms ('join us', 'work with us', 'contact us') never match.
+_GEO_DENY_SCOPE_RX = re.compile(
+    r"\(usa?\b|\[usa?\b"                                   # (US) / (USA) / [US]
+    r"|\bu\.s\.a?\.?"                                      # U.S. / U.S.A.
+    r"|\b(?:namer|apac|latam)\b"                           # region acronyms
+    r"|united states|north america|americas"              # spelled-out regions
+    r"|\busa?[\s-]+(?:only|based|remote|region|market|citizen|resident)"  # US-based / US remote / US only
+    r"|(?:within|based\s+in|located\s+in|reside\s+in|residing\s+in|relocat\w*\s+to)"
+    r"\s+(?:the\s+)?usa?\b",                               # within / based in (the) US
+    re.IGNORECASE,
 )
 
 
-# Precompiled once (looks_like_sentence is called per-selector in a loop).
+def _geo_has_deny_scope(low: str) -> bool:
+    """True if the span names a deny-scoped region (US/NAMER/APAC/LATAM)."""
+    return _GEO_DENY_SCOPE_RX.search(low) is not None
+# Duty-sentence detection. Words like 'support'/'lead'/'build' are duty VERBS in a
+# sentence but also common NOUNS in real labels ('Support Center', 'Lead office',
+# 'Build St'). A token-presence OR length test drops those valid labels (a long
+# noun-phrase label like 'Sofia Tech Park Support Center' is not a duty sentence) —
+# so we detect a duty sentence purely by GRAMMATICAL STRUCTURE, independent of
+# length: an unambiguous sentence-opener ('you will…'), OR a duty verb directly
+# governing an object via a preposition ('relocate to', 'support for'). A noun-phrase
+# label has neither, at any length, so it survives.
+_GEO_DUTY_VERBS = (
+    "provide", "support", "relocate", "manage", "lead", "build", "deliver",
+    "develop", "deploy", "maintain", "design", "implement", "drive",
+)
+_GEO_DUTY_SENTENCE_MARKERS = (
+    "you will", "we are looking for", "we offer", "responsible for",
+    "looking for a", "looking for an",
+)
+# A duty verb DIRECTLY governing an object via a preposition: "relocate to",
+# "support for", "build into". Deliberately NOT broadened to allow an object noun
+# between verb and preposition ("manage delivery for"): that bridge cannot be
+# distinguished from a noun-phrase label ("Lead Engineer in Sofia") and would drop
+# real labels. The trade is intentional — a rare verb-noun-prep duty clause that
+# slips through is KEPT (then Gate 2 soft → human review), the safe failure
+# direction; dropping a real location is the unsafe one we refuse.
+_GEO_DUTY_GOVERNS = re.compile(
+    r"\b(?:" + "|".join(_GEO_DUTY_VERBS) + r")\s+(?:to|for|into|across|in)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_duty_sentence(low: str) -> bool:
+    """True if the span reads as a job-duty sentence rather than a location label.
+
+    Purely GRAMMATICAL, independent of length (length wrongly dropped long
+    noun-phrase labels like 'Sofia Tech Park Support Center'): a duty sentence has
+    an unambiguous sentence-opener ('you will…', 'we offer…'), OR a duty verb that
+    directly GOVERNS an object via a preposition ('relocate to', 'support for',
+    'build into'). A noun-phrase label whose words merely include a verb-homograph
+    ('Support Center Plovdiv', 'Lead Software Engineer Office Sofia') has neither,
+    at any length, so it is NOT a duty sentence.
+    """
+    if any(mark in low for mark in _GEO_DUTY_SENTENCE_MARKERS):
+        return True
+    return _GEO_DUTY_GOVERNS.search(low) is not None
+
+
+# Precompiled once (looks_like_sentence runs over every candidate span).
 _SENTENCE_MIDDLE = re.compile(r"[.!?]\s+[A-ZА-Я]")
 _SENTENCE_END = re.compile(r"[.!?]$")
 
@@ -102,15 +203,27 @@ def classify_location_spans(span_texts: list[str]) -> str:
     """Pick a work-location label from candidate detail-page <span> texts.
 
     jobs.bg detail pages have no structured location element — the town /
-    remote phrase is just a bare <span>. We scan candidates in document order
-    and return the first that is a genuine work location: a short (non-prose)
-    string matching the BG-town or remote/hybrid allowlist, that is NOT a known
-    false-friend ('Remote interview' describes the interview, not the job).
+    remote phrase is just a bare <span>. We score EVERY qualified candidate and
+    return the best by ALLOW-OVER-DENY precedence (not first-span-wins, which used
+    to discard a qualifying sibling — e.g. ['Remote (US)', 'Remote (EMEA)'] wrongly
+    returned the US span, losing the clean EMEA one and triggering a hard-fail):
+
+        tier 3 — clean BG-town  (town hit, no deny-scoped region)
+        tier 2 — clean remote/hybrid (remote hit, not negated, no deny-scoped region)
+        tier 1 — deny-bearing geo span (town/remote that ALSO names US/NAMER/APAC)
+
+    A span must still clear all the same per-span disqualifiers (prose, traps,
+    company names, duty sentences). Highest tier wins; on a tie the FIRST (document
+    order) is kept, preserving the existing precedence tests. A lone deny-scoped span
+    is still returned (tier 1 > nothing) so Gate 2 can see and deny it — we never
+    invent a clean location.
 
     Returns "" when nothing usable is found, so the caller leaves job['location']
     blank and Gate 2 falls back to its body keyword scan -> soft.
     Pure (no I/O) so it is unit-testable without a browser.
     """
+    best_text = ""
+    best_tier = 0  # 0 = nothing chosen; 3 town-clean > 2 remote-clean > 1 deny-bearing
     for raw in span_texts:
         t = (raw or "").strip()
         if not t or len(t) > 45 or looks_like_sentence(t):
@@ -122,23 +235,37 @@ def classify_location_spans(span_texts: list[str]) -> str:
         # (EOOD/ЕООД/GmbH/…) anywhere in the span is a company, never a location.
         if any(low.startswith(p) for p in _GEO_COMPANY_PREFIXES):
             continue
-        if _GEO_ENTITY_SUFFIX.search(t):
+        if _GEO_ENTITY_ANY.search(t) or _GEO_ENTITY_EDGE.search(t):
             continue
-        # Job-duty / product-name prose where a geo token is incidental, not a label.
-        if any(marker in low for marker in _GEO_PROSE_MARKERS):
+        # Job-duty SENTENCE where a geo token is incidental, not a label — detected
+        # structurally (verb governing a clause), so noun-phrase labels carrying a
+        # verb-homograph ('Support Center Plovdiv', 'Lead Engineer, Sofia') survive.
+        if _is_duty_sentence(low):
             continue
         # Town tokens on WORD BOUNDARIES so 'ruse' does not match inside 'Ruseville'.
         town_hit = any(
             re.search(r"\b" + re.escape(tok) + r"\b", low) for tok in _GEO_TOWN_TOKENS
         )
-        if town_hit:
-            return t
-        # Remote phrase — but only if not negated ('No remote work, strictly on-site').
-        if any(ph in low for ph in _GEO_REMOTE_PHRASES):
+        remote_hit = False
+        if not town_hit and _geo_remote_hit(low):
+            # Remote phrase — but only if not negated ('No remote work, strictly
+            # on-site'). The town branch deliberately does NOT run this check, so a
+            # town span carrying a remote caveat ('Sofia (no remote)') is still kept.
             if any(neg in low for neg in _GEO_REMOTE_NEGATORS):
                 continue
-            return t
-    return ""
+            remote_hit = True
+        if not town_hit and not remote_hit:
+            continue
+        # ALLOW-OVER-DENY: a clean (deny-free) span outranks a deny-scoped one.
+        deny_scoped = _geo_has_deny_scope(low)
+        if town_hit:
+            tier = 1 if deny_scoped else 3
+        else:  # remote_hit
+            tier = 1 if deny_scoped else 2
+        # Highest tier wins; ties keep the FIRST (document order) — strict '>'.
+        if tier > best_tier:
+            best_tier, best_text = tier, t
+    return best_text
 
 
 def build_jobsbg_search_url(keyword: str, location: dict, offset: int = 0) -> str:

@@ -268,6 +268,17 @@ class TestClassifyLocationSpans:
         ]:
             assert classify_location_spans([span]) == "", f"company not skipped: {span!r}"
 
+    def test_ambiguous_entity_token_midstring_is_kept(self):
+        """AUDIT FIX: a short ambiguous legal token (ad/ag/sa) that appears
+        MID-STRING is incidental text, not a company name — the label must survive.
+        Only a leading/trailing occurrence (company-name position) disqualifies."""
+        for span, expected in [
+            ("Sofia, ad-tech district", "Sofia, ad-tech district"),
+            ("Plovdiv AG campus", "Plovdiv AG campus"),
+        ]:
+            assert classify_location_spans([span]) == expected, \
+                f"mid-string token wrongly dropped: {span!r}"
+
     def test_gmbh_suffix_skipped(self):
         """BUG 2: 'GmbH' is a company suffix and must be skipped, not read as a
         Varna location."""
@@ -284,19 +295,157 @@ class TestClassifyLocationSpans:
         assert classify_location_spans(["Sofia (no remote)"]) == "Sofia (no remote)"
 
     def test_duty_and_product_prose_skipped(self):
-        """BUG 5: job-duty / product-name prose where a geo token is incidental is
-        not a location label ('Hybrid car parts', 'Varna Beach festival app',
-        'remote support … in Sofia')."""
+        """BUG 5: job-duty prose (a verb-bearing sentence) where a geo token is
+        incidental is not a location label. Detected structurally (a duty VERB +
+        length), not via a list of bare common nouns that collide with real labels."""
         for span in [
-            "Hybrid car parts warehouse",
-            "Опит с Varna Beach festival app",
             "Remote support for clients in Sofia",
             "Provide remote support to our Varna team",
             "You will relocate to Plovdiv",
+            "We are looking for a Sofia-based engineer to join",
         ]:
             assert classify_location_spans([span]) == "", f"prose not skipped: {span!r}"
+
+    def test_real_location_labels_with_common_words_survive(self):
+        """AUDIT FIX (the prose-marker false-negative): bare common words like
+        'team', 'near', 'located in' are NOT reliable prose markers — they appear
+        in legitimate short location labels, which must survive classification."""
+        for span, expected in [
+            ("Located in Sofia", "Located in Sofia"),
+            ("Remote (CET team)", "Remote (CET team)"),
+            ("Varna, near the port", "Varna, near the port"),
+            ("Remote - Bulgaria team", "Remote - Bulgaria team"),
+            ("Stara Zagora", "Stara Zagora"),
+        ]:
+            assert classify_location_spans([span]) == expected, \
+                f"real label wrongly dropped: {span!r} -> {classify_location_spans([span])!r}"
+
+    def test_duty_verb_as_noun_in_label_survives(self):
+        """RE-AUDIT CRITICAL (class-covering): duty words (lead/support/build/develop/
+        manage/design) are ALSO common nouns in real location labels. A duty SENTENCE
+        is disqualified by STRUCTURE (sentence-opener, or a verb directly governing an
+        object via a preposition), NOT by token presence or span length. So noun-phrase
+        labels carrying these words survive AT EVERY LENGTH (this is the round-2
+        regression: 5-8 word labels were wrongly dropped by a length heuristic)."""
+        for span in [
+            "Support Center Plovdiv",                 # 3
+            "Lead Engineer, Sofia",                   # 3
+            "Build St, Sofia",                        # 3
+            "Manage district, Sofia",                 # 3
+            "Develop Park, Plovdiv",                  # 3
+            "Design Studio Office, Varna",            # 4
+            "Sofia Tech Park Support Center",         # 5  (round-2 regression)
+            "Lead Software Engineer Office Sofia",    # 5  (round-2 regression)
+            "Sofia Build Center Main Office Hub",     # 6
+            "Plovdiv Lead Innovation Support Campus North",  # 6
+        ]:
+            assert classify_location_spans([span]) == span, \
+                f"label with verb-homograph wrongly dropped: {span!r} -> {classify_location_spans([span])!r}"
+
+    def test_real_duty_sentences_still_dropped(self):
+        """RE-AUDIT guard (class-covering): genuine job-duty SENTENCES must still be
+        dropped — via a sentence-opener OR a verb governing an object. Covers short
+        (verb+prep) and opener-led forms so the structural rule is pinned both ways."""
+        for span in [
+            "Provide remote support to our Varna team",   # governs: support to
+            "You will relocate to Plovdiv",               # opener + governs
+            "We are looking for a Sofia-based engineer to join",  # opener
+            "Relocate to Sofia",                          # short, governs: relocate to
+            "We offer relocation for the Sofia office",   # opener: we offer
+            "Build into the Plovdiv market",              # governs: build into
+        ]:
+            assert classify_location_spans([span]) == "", f"duty sentence not dropped: {span!r}"
+
+    def test_duty_detection_prefers_keeping_real_labels_over_catching_all_duties(self):
+        """DELIBERATE TRADE-OFF: the duty rule is verb+preposition only. A rarer
+        verb-OBJECT-preposition duty clause ('Manage delivery for the hub') is NOT
+        caught — broadening to a \\w+ bridge would also drop real labels like 'Lead
+        Engineer in Sofia office'. We choose the SAFE failure: an uncaught duty span
+        is KEPT (Gate 2 then routes it to soft/manual review), never dropping a real
+        location. This test PINS that intentional choice so it isn't 'fixed' into a
+        regression."""
+        # Real label with verb-homograph + preposition — MUST survive.
+        assert classify_location_spans(["Lead Engineer in Sofia office"]) == \
+            "Lead Engineer in Sofia office"
+        # The accepted leak: a verb-object-prep duty clause is kept (safe direction).
+        assert classify_location_spans(["Manage delivery for the Sofia hub"]) == \
+            "Manage delivery for the Sofia hub"
+
+    def test_bare_remote_matched_on_word_boundary_not_substring(self):
+        """RE-AUDIT CRITICAL: bare 'remote' must match as a WORD, not a substring —
+        'remotely managed' / 'remote sensing' are NOT remote-work locations."""
+        for span in ["Remotely managed position", "Remote sensing engineer",
+                     "Remote-controlled systems role"]:
+            assert classify_location_spans([span]) == "", \
+                f"substring 'remote' over-accepted: {span!r} -> {classify_location_spans([span])!r}"
+        # ...but a real bare 'Remote' tag still passes
+        assert classify_location_spans(["Remote (CET team)"]) == "Remote (CET team)"
+
+    def test_leading_hyphenated_ambiguous_token_is_kept(self):
+        """RE-AUDIT CRITICAL: a leading 'ad-'/'ag-' that is part of a HYPHENATED word
+        ('ad-tech district') is ordinary text, not a company-name token — keep it.
+        Only a standalone leading/trailing entity token ('Ad Astra', '...EAD') drops."""
+        assert classify_location_spans(["ad-tech district, Sofia"]) == "ad-tech district, Sofia"
+        assert classify_location_spans(["ag-grid hub, Varna"]) == "ag-grid hub, Varna"
+        # control: standalone leading entity token still drops
+        assert classify_location_spans(["Ad Astra Bulgaria"]) == ""
 
     def test_town_token_matched_on_word_boundary(self):
         """BUG 6: 'ruse' must not match inside 'Ruseville' — town tokens are matched
         on word boundaries, not as bare substrings."""
         assert classify_location_spans(["Ruseville Software"]) == ""
+
+    # --- ARCHITECTURAL FIX (2026-06-30): allow-over-deny span selection -----------
+    # First-span-wins discarded a qualifying sibling: ["Remote (US)","Remote (EMEA)"]
+    # returned the US span (deny -> hard_fail), losing the clean EMEA sibling. The
+    # classifier now scores ALL qualified spans and prefers a clean (deny-free) one:
+    # clean BG-town > clean remote > deny-bearing span. Ties keep the first (document
+    # order) so the existing precedence tests are preserved.
+
+    def test_clean_remote_sibling_wins_over_deny_scoped(self):
+        """G-emea-sibling: a clean Remote(EMEA) span outranks a deny-scoped Remote(US)
+        span regardless of order — the qualifying sibling is no longer discarded."""
+        assert classify_location_spans(["Remote (US)", "Remote (EMEA)"]) == "Remote (EMEA)"
+        # order-independent: US later must still lose to the clean EMEA span
+        assert classify_location_spans(["Remote (EMEA)", "Remote (US)"]) == "Remote (EMEA)"
+
+    def test_sole_deny_scoped_span_still_surfaced(self):
+        """G-us-only: a lone deny-scoped span is STILL returned (it is the only
+        candidate) so Gate 2 can see and deny it — we never invent a clean location."""
+        assert classify_location_spans(["Remote (US)"]) == "Remote (US)"
+
+    def test_clean_town_outranks_deny_scoped_remote(self):
+        """G-town-over-deny: a clean BG town outranks a deny-scoped remote span."""
+        assert classify_location_spans(["Remote (US)", "Sofia"]) == "Sofia"
+
+    def test_tie_between_clean_spans_keeps_first(self):
+        """G-tie-first regression: two clean spans of equal tier keep the FIRST
+        (document order) — preserves the Plovdiv-before-Sofia precedence test."""
+        assert classify_location_spans(["Plovdiv", "Remote interview", "Sofia"]) == "Plovdiv"
+
+    def test_town_with_negated_remote_still_kept(self):
+        """G-town-negation regression: a town span carrying a remote caveat is still a
+        (town) location — the new scoring path must not run the remote-negator check
+        on a town hit."""
+        assert classify_location_spans(["Sofia (no remote)"]) == "Sofia (no remote)"
+
+    def test_single_span_naming_both_regions_is_surfaced(self):
+        """G-both-in-one-span (edge): a span naming BOTH a denied and an allowed region
+        ('Remote (US & EU)') is deny-scoped (tier 1) but, as the sole candidate, is
+        still returned for the gate to disambiguate."""
+        assert classify_location_spans(["Remote (US & EU)"]) == "Remote (US & EU)"
+
+    def test_pronoun_us_does_not_deny_scope_a_clean_town(self):
+        """G-pronoun-us (R2 audit, MAJOR false-reject): the bare 'us' deny-scope token
+        must NOT match the English PRONOUN 'us' ('Join us in Sofia', 'work with us').
+        It did, demoting a clean BG-town span to tier 1 so a 'Remote (US)' sibling won
+        — discarding the clean Sofia location and hard-rejecting a real €140k BG role.
+        Deny-scope must require genuine US-REGION context, not the pronoun."""
+        # the clean town span must WIN over the deny-scoped Remote (US) sibling
+        assert classify_location_spans(["Remote (US)", "Join us in Sofia"]) == "Join us in Sofia"
+        assert classify_location_spans(["Come work with us, Varna"]) == "Come work with us, Varna"
+        # control: a GENUINE US-region span is still deny-scoped (tier 1), so a clean
+        # sibling still outranks it — and alone it is still surfaced for the gate.
+        assert classify_location_spans(["Remote (US)", "Sofia"]) == "Sofia"
+        assert classify_location_spans(["US-based remote", "Plovdiv"]) == "Plovdiv"
+        assert classify_location_spans(["Remote (US)"]) == "Remote (US)"

@@ -442,9 +442,12 @@ GAP_PENALTY_CAP = 0
 
 # FIT_NORMALIZER_PCT: the match_score percent treated as a "full" fit (-> fit_signal 1.0).
 # match_score divides matched skill weight by the sum of ALL your skills, so real
-# postings often score only ~5-16%; dividing by a flat 100 makes w_fit a near-no-op.
-# Lower this (e.g. ~50) to rescale the realistic band so fit competes with the gap
-# penalty. 100.0 = legacy raw /100 behaviour.
+# postings often score only ~5-16%. Dividing by a flat 100 leaves w_fit a near-no-op
+# (+0.2..+0.6) — fine if you want lane/geo/comp to dominate, but if you actually want
+# candidate-fit to move the ranking, set this to ~50 so the realistic score band
+# rescales to ~0..1 and competes with w_gap.
+#   100.0 = conservative default: fit barely nudges rank (back-compatible).
+#    ~50  = active: fit becomes a real lever (recommended once a resume PDF is wired in).
 FIT_NORMALIZER_PCT = 100.0
 
 # ──────────────────────────────────────────────

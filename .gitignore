@@ -119,3 +119,6 @@ docs/superpowers/
 debug_html/
 # Ad-hoc local validation harness (not part of the test suite).
 validate_filter_samples.py
+# Local retro / session-log artifacts (internal notes, not for the public repo).
+gotchas.md
+docs/sessions/

@@ -289,6 +289,23 @@ _GEO_WORKAUTH_BOILERPLATE = (
 )
 _GEO_NEGATORS = ("not", "no longer", "except", "isn't", "isnt", "never", "without")
 
+# REGION-scope deny detector (ALLOW-OVER-DENY fix). A deny phrase is REGION-scoped
+# when it names a forbidden REGION (US / NAMER / APAC / LATAM) rather than a forbidden
+# MODALITY (forced relocation / on-site). Only region-scope denies soften when a clean
+# allow sibling co-exists; modality denies stay HARD even with a sibling (spec pins
+# Western relocation as a hard gate). Matches the deny PHRASES in LOCATION_DENY:
+# 'remote (us)', 'us-remote', 'namer only', 'apac only', 'must reside in the united
+# states', … — and never 'relocation required' / 'on-site only' / 'based in london'.
+_GEO_REGION_DENY_RX = re.compile(
+    r"\b(?:us|usa|namer|apac|latam|canada)\b|\(us\)|united states|north america|americas",
+    re.IGNORECASE,
+)
+# The bare ambiguous allow token: 'remote' alone does NOT prove a clean non-US region
+# (it is also the literal substring of 'remote (us)' / 'remote within us'), so it must
+# not count as the clean sibling that softens a US-region deny. A positively-scoped
+# allow (emea / eu / europe / fully remote / a BG signal / EOR) does.
+_GEO_AMBIGUOUS_ALLOW = ("remote",)
+
 
 def _norm_geo(s: str) -> str:
     """NFKC + lower-case + whitespace-collapse. Keeps diacritics (ü/ö)."""
@@ -351,22 +368,50 @@ def passes_geo_gate(job: dict) -> GateResult:
         eor_override = any(hint in hay for hint in _GEO_EOR_OVERRIDE_HINT)
         only_boilerplate = all(d in _GEO_WORKAUTH_BOILERPLATE for d in deny_hits)
 
+        # MODALITY vs REGION (the single invariant behind every soft escape below). A
+        # deny softens to manual_review ONLY when EVERY matched deny is REGION-scoped
+        # (US/NAMER/APAC/LATAM). A MODALITY deny (forced relocation / on-site-only) is
+        # NEVER softened by a co-occurring remote/EOR allow — the spec pins Western
+        # relocation as a HARD gate ("relocation destroys the arbitrage"). Computing
+        # this once and gating ALL THREE soft clauses on it closes the R2-audit leak
+        # where the EOR-override / contrast clauses softened a relocation deny just
+        # because a 'remote (emea)' / 'work from anywhere' phrase appeared nearby.
+        all_region_scope = all(_GEO_REGION_DENY_RX.search(d) for d in deny_hits)
+
         # Red-team #7: a US-auth/regional deny that co-occurs with an explicit
         # EOR / remote-EMEA / remote-global allow downgrades to soft (the role
-        # plausibly hires EMEA via EOR — only a recruiter can confirm).
-        if only_boilerplate and (eor_override or has_clean_remote_allow):
+        # plausibly hires EMEA via EOR — only a recruiter can confirm). Gated on
+        # region-scope so a modality deny can never reach it (work-auth boilerplate is
+        # itself region-scoped, so the legitimate boilerplate path is unaffected).
+        if all_region_scope and only_boilerplate and (eor_override or has_clean_remote_allow):
             reasons = [
                 "GEO manual_review (EOR override): work-auth deny "
                 f"{deny_hits[:3]} co-occurs with remote/EOR allow"
             ]
             return GateResult(status="soft", signal=0.5, reasons=reasons)
 
-        # Red-team #9 fallback: a deny phrase AND a clean EMEA/EU/global remote
+        # Red-team #9 fallback: a REGION deny phrase AND a clean EMEA/EU/global remote
         # allow both present (contrast sentence) -> soft for human disambiguation.
-        if has_clean_remote_allow and eor_override:
+        if all_region_scope and has_clean_remote_allow and eor_override:
             reasons = [
-                "GEO manual_review (contrast): deny "
+                "GEO manual_review (contrast): region deny "
                 f"{deny_hits[:3]} co-occurs with clean remote allow {allow_hits[:3]}"
+            ]
+            return GateResult(status="soft", signal=0.5, reasons=reasons)
+
+        # ALLOW-OVER-DENY (REGION-scope only). A region deny that co-occurs with a
+        # GENUINE clean allow sibling routes to soft: the posting names at least one
+        # qualifying region, so a human disambiguates rather than the gate discarding
+        # the qualifying sibling (the live false-reject this fix targets). The clean
+        # sibling must be POSITIVELY scoped (EMEA/EU/Europe/BG/EOR), NOT the ambiguous
+        # bare token 'remote' — which is also the literal substring of 'remote (us)' /
+        # 'remote within us', so it must not rescue a pure-US role.
+        clean_sibling = [h for h in allow_hits if h not in _GEO_AMBIGUOUS_ALLOW]
+        if all_region_scope and clean_sibling:
+            reasons = [
+                "GEO manual_review (allow-over-deny): region deny "
+                f"{deny_hits[:3]} co-occurs with clean allow {clean_sibling[:3]} "
+                "- needs human disambiguation"
             ]
             return GateResult(status="soft", signal=0.5, reasons=reasons)
 
@@ -423,23 +468,214 @@ _RANGE = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
-_SALARY_CUES = (
-    "salary", "compensation", "comp", "pay", "package", "ote", "/yr", "/year",
-    "per annum", "per year", "годишно", "/mo", "/month", "per month", "месечно",
-    "заплата", "remuneration", "gross", "net", "бруто", "нето", "wage", "/day",
-    "per day", "day rate", "daily rate", "/hr", "/hour", "per hour",
-)
 # Non-comp number contexts to actively exclude (standards numbers etc.).
 _NONCOMP_NEG = ("iso", "soc", "27001", "27002", "42001", "nist", "version", "v.")
-# Headcount / team-size words: a number adjacent to one of these is company size,
-# never compensation. Live false-parse (DBA @ DEVEXPERTS): "a team of more than
-# 800+ professionals, the comp..." parsed 800 as €800/mo -> €9,600/yr because
-# 'comp' sat in the window. Matched as word-boundary cues near the number.
+# Headcount / team-size nouns: when a number is IMMEDIATELY counting one of these
+# ("800+ professionals", "team of 1500 people"), it is company size, not comp.
+# Live false-parse (DBA @ DEVEXPERTS): "a team of more than 800+ professionals, the
+# comp..." parsed 800 as €800/mo -> €9,600/yr because 'comp' sat in the window.
+#
+# The discriminator is GRAMMATICAL POSITION, not currency. A count noun sits as the
+# number's IMMEDIATE next token ("800 developers"); a salary's beneficiary noun is
+# separated by a preposition ("50000 FOR developers", "45000 PER specialists").
+# _HEADCOUNT_DIRECTLY_AFTER matches only the immediate-count form, so a cue-anchored
+# currency-less salary ("Salary band 50000 for developers") is never dropped.
 _HEADCOUNT_WORDS = (
     "professionals", "experts", "employees", "people", "colleagues",
     "specialists", "engineers", "developers", "members", "staff",
-    "team of", "team members", "headcount", "fte", "consultants",
+    "headcount", "fte", "consultants",
 )
+# Number directly counts a headcount noun: optional '+', optional whitespace, then
+# the noun — with NO intervening preposition (for/per/to/of-the). "team of N" is
+# handled by the leading 'team of' phrasing matched on the pre-number window.
+_HEADCOUNT_DIRECTLY_AFTER = re.compile(
+    r"^\+?\s*(?:" + "|".join(re.escape(w) for w in _HEADCOUNT_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+# "team of <N>" / "team of more than <N>": the count phrase precedes the number.
+# The bridge between 'team of' and the number is restricted to explicit count
+# HEDGES (more than / over / about / ~ / nearly / approximately) — NOT arbitrary
+# words. A loose '\w{0,3}' bridge wrongly swallowed an unrelated salary that merely
+# appeared a few words after a 'team of …' clause ("team of experts offering 80000").
+_HEADCOUNT_BEFORE = re.compile(
+    r"team of\s+(?:(?:more than|over|about|around|nearly|approximately|roughly)\s+)?$",
+    re.IGNORECASE,
+)
+# How far past the number to look for the immediately-counted noun.
+_HEADCOUNT_LOOKAHEAD = 18
+
+# ── LABEL-GATED comp admission (ARCHITECTURAL FIX 2026-06-30, Option B) ──────────
+# The spec floors comp on a DISCLOSED salary ONLY ("≤72k auto-reject — disclosed only";
+# undisclosed -> manual_review, never reject). Four prior rounds proved that BLOCKLISTING
+# non-salary numbers (budget/revenue/margin/turnover/headcount, × EN+BG, × inflections,
+# × punctuation) never converges — natural language always supplies one more non-salary
+# noun. So we INVERT the default: a number is admitted as comp ONLY when something
+# AFFIRMATIVELY marks it as pay. The allowlist of "pay" markers is small and bounded
+# (there are only so many ways to write 'salary'), so admission is decidable; a phantom
+# (margin/turnover/budget) figure is never admitted regardless of phrasing.
+#
+# Admission rule (see _comp_admits): a money candidate is comp iff EITHER
+#   (a) a HARD salary LABEL binds it — the nearest money-context noun in its CLAUSE is a
+#       salary label, not a non-salary noun ("Salary: 60000", "Заплата 50000 лв"); OR
+#   (b) CURRENCY is adjacent AND no non-salary noun governs it in-clause ("$150,000/yr",
+#       "€120k", "60 000 лв") — a bare-currency disclosure boards emit without the word
+#       'salary'.
+# A bare integer with neither (currency nor a binding label) is NOT comp — this alone
+# kills "gross margin reached 50000" / headcount integers, with no noun list.
+#
+# 'gross'/'net' are BASIS-only cues (see _GROSS_CUES/_NET_CUES below); they are NOT
+# salary labels and NEVER admit a number on their own ("gross margin 50000" is not pay).
+_SALARY_LABELS = (
+    "salary", "compensation", "remuneration", "wage", "wages", "payroll",
+    "base pay", "annual pay", "заплата", "възнаграждение", "заплащане",
+)
+# Non-salary money-context nouns: when one of these BINDS the number (is the nearest
+# money-context noun in the clause) the figure is company spend, not pay. This list is
+# now only a TIEBREAKER against a co-present currency (rule (b)); correctness no longer
+# rests on it being exhaustive, because rule (a)/(b) already refuse a bare integer.
+# Cyrillic stems are suffix-tolerant (BG inflects with trailing articles: бюджетът,
+# оборота, приходите) — a trailing \b fails between two Cyrillic letters.
+_NONSALARY_CONTEXT_WORDS = (
+    "budget", "budgets", "revenue", "revenues", "turnover", "arr", "mrr",
+    "funding", "grant", "grants", "valuation", "raised", "investment",
+    "allowance", "stipend", "reimbursement", "discount", "savings", "spend",
+    "margin", "margins", "profit", "profits", "income", "ebitda", "bookings",
+)
+_NONSALARY_CONTEXT_BG = ("бюджет", "приход", "оборот", "печалб", "инвестиц", "финансиран")
+_SALARY_LABEL_RX = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _SALARY_LABELS) + r")"
+    r"|заплат[а-я]*|възнагражд[а-я]*",
+    re.IGNORECASE | re.UNICODE,
+)
+_NONSALARY_CONTEXT_RX = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _NONSALARY_CONTEXT_WORDS) + r")\b"
+    r"|\b(?:" + "|".join(_NONSALARY_CONTEXT_BG) + r")[а-я]*",
+    re.IGNORECASE | re.UNICODE,
+)
+# Clause boundaries scope "what binds this number": sentence enders PLUS ';' and
+# newline (a budget line item after ';' must not be bound by a salary label before it).
+_CLAUSE_SPLIT_RX = re.compile(r"[.!?;\n]")
+
+
+def _clause_bounds(t: str, start: int) -> tuple[int, int]:
+    """Return [clause_start, clause_end) of the clause containing position `start`."""
+    clause_start = 0
+    for m in _CLAUSE_SPLIT_RX.finditer(t, 0, start):
+        clause_start = m.end()
+    end_m = _CLAUSE_SPLIT_RX.search(t, start)
+    clause_end = end_m.start() if end_m else len(t)
+    return clause_start, clause_end
+
+
+# Grammatical GLUE that may sit between a number and the word that governs it without
+# breaking governance: articles/prepositions/copulas/modals/hedges. A COMMA or clause
+# break ends the walk. These are bounded function words, NOT a domain blocklist.
+_GOVERN_CONNECTIVES = {
+    "is", "are", "was", "were", "be", "been", "being", "of", "the", "a", "an",
+    "per", "at", "to", "for", "this", "that", "our", "your", "their", "its",
+    "with", "and", "or", "up", "around", "about", "approximately", "circa",
+    "from", "between", "starting", "range", "will", "would", "shall", "can",
+    "could", "may", "comes", "come", "amounts", "amount", "totals", "total",
+    "equals", "reaches", "reach", "set", "sits", "stands", "roughly", "nearly",
+    "over", "under", "min", "max", "minimum", "maximum",
+    "е", "на", "от", "до", "са", "в", "и", "или", "е.г",
+}
+# Currency / period / basis unit tokens — not "content" for governance purposes.
+_GOVERN_UNIT_TOKENS = {
+    "eur", "usd", "gbp", "bgn", "k", "m", "лв", "лев", "лева", "year", "yr",
+    "years", "month", "months", "mo", "annum", "annually", "annual", "gross",
+    "net", "бруто", "нето", "годишно", "месечно", "pa", "pm",
+}
+# POSITIVE salary-context governors (the bounded Option-B allowlist — the ways a JD
+# MARKS a number as pay). When the word governing a figure is one of these, the figure
+# is comp; when it is ANY OTHER content word (size/cost/value/pool/fee/budget/margin/…)
+# the figure is a non-salary phantom and is refused — with NO non-salary list. The
+# multi-form salary LABELS (salary/compensation/заплата…) are also accepted via
+# _SALARY_LABEL_RX so inflected/Bulgarian forms count.
+_SALARY_CONTEXT_GOVERNORS = {
+    "rate", "rates", "base", "band", "bands", "package", "packages", "pay",
+    "comp", "compensation", "remuneration", "ote", "salary", "salaries", "wage",
+    "wages", "payroll", "offer", "offers", "offering", "offered", "paying",
+    "pays", "paid", "earn", "earning", "earnings", "income",
+}
+_WORD_CHARS = "_'"
+
+
+def _word_left_of(clause: str, pos: int) -> tuple[str, int] | None:
+    """The word token ending at-or-before `pos` (skipping currency/glue punctuation),
+    as (lowercased_word, word_start_index). None if a comma/clause break or string
+    start intervenes first (governance broken — the number is its own clause subject)."""
+    i = pos - 1
+    while i >= 0 and clause[i] in " \t:=-–—()+€$£":
+        i -= 1
+    if i < 0 or clause[i] in ",.;":
+        return None
+    j = i
+    while j >= 0 and (clause[j].isalnum() or clause[j] in _WORD_CHARS):
+        j -= 1
+    word = clause[j + 1:i + 1]
+    if not word:
+        return None
+    return word.lower(), j + 1
+
+
+def _governing_head(clause: str, rel_start: int, rel_end: int) -> str | None:
+    """Return the CONTENT word that grammatically governs the number at `rel_start`, or
+    None if the number is ungoverned (a bare amount, or its own clause subject).
+
+    Walks left over connective/unit/currency/numeric tokens; the first CONTENT word is
+    the head. 'deal size is 60000 eur' -> 'size'; 'project cost 200000' -> 'cost';
+    '$150,000/yr' / 'eur 120k' -> None (only currency/units precede); 'we offer €70000'
+    -> 'offer'; 'your salary, after the allowance, will be 60000' -> None (the walk
+    skips 'will be' as glue and hits the comma after 'allowance' -> ungoverned, so the
+    in-clause salary label admits it)."""
+    pos = rel_start
+    while pos > 0:
+        res = _word_left_of(clause, pos)
+        if res is None:
+            return None
+        w, w_start = res
+        # Glue: function words, currency/period units, and bare numbers / number+unit
+        # tokens (a range lo like '90k' left of the hi '110k', or '5 000' grouping).
+        if (w in _GOVERN_CONNECTIVES or w in _GOVERN_UNIT_TOKENS
+                or re.fullmatch(r"\d[\d.,]*[km]?", w)):
+            pos = w_start
+            continue
+        return w
+    return None
+
+
+def _comp_admits(t: str, start: int, end: int, has_currency: bool) -> bool:
+    """True if the money span [start,end) is admissible as DISCLOSED comp.
+
+    LABEL-GATED (Option B, structural). Decided within the number's CLAUSE
+    (';'/newline/sentence-scoped). Let H = the content word that grammatically GOVERNS
+    the number (_governing_head — walks left over only function/currency/unit words):
+      (a) ADMIT if H marks PAY — a salary LABEL or a salary-context governor
+          (rate/base/band/package/offer/paying/…). "Salary: 60000", "We offer €70,000",
+          "Rate: €120/hour", "Salary band 50000".
+      (b) else ADMIT if the number is UNGOVERNED (H is None) AND (currency is adjacent OR
+          a salary label is elsewhere in-clause). Covers bare disclosures ("$150,000/yr",
+          "€120k", "60 000 лв") and the salary-subject clause ("Your salary, after the
+          allowance, will be 60000").
+      (c) else REFUSE — H is a NON-salary content noun ("deal size", "project cost",
+          "prize pool", "turnover", "fee", BG "разход") or a bare integer with no
+          currency. Refuses EVERY non-salary money figure structurally, with NO
+          enumerated non-salary list (closing the rule-(b) blocklist whack-a-mole).
+    """
+    clause_start, clause_end = _clause_bounds(t, start)
+    clause = t[clause_start:clause_end]
+    rel_start, rel_end = start - clause_start, end - clause_start
+
+    head = _governing_head(clause, rel_start, rel_end)
+    if head is not None:
+        if head in _SALARY_CONTEXT_GOVERNORS or _SALARY_LABEL_RX.fullmatch(head):
+            return True                   # a pay marker governs the number
+        return False                      # a non-salary content noun governs it -> phantom
+    # head is None: the number is ungoverned within its clause.
+    if _SALARY_LABEL_RX.search(clause) is not None:
+        return True                       # salary clause subject ("salary, …, 60000")
+    return bool(has_currency)             # bare currency amount, no governing noun
 
 _MONTHLY_CUES = (
     "/mo", "/month", "per month", "a month", " pm", "месечно", "на месец",
@@ -589,30 +825,33 @@ def parse_comp(text: str) -> ParsedComp | None:
         has_currency = bool(pre or post) or any(s in win for s in ("€", "$", "£")) \
             or re.search(r"\b(?:eur|usd|gbp|bgn)\b", win) is not None \
             or any(l in win for l in ("лв", "лев", "лева"))
-        has_cue = _has_cue(win, _SALARY_CUES)
-        if not has_currency and not has_cue:
-            continue  # bare number with no anchor — not comp (red-team #11)
+
+        # LABEL-GATED ADMISSION (Option B). A number is comp ONLY when a salary label
+        # binds it OR currency is adjacent with no non-salary noun governing it in its
+        # clause. A bare integer near business jargon ("gross margin 50000") or a
+        # company-spend figure ("turnover 5,000,000 EUR", "Бюджетът … 50000 EUR") is
+        # NOT admitted — so a phantom can never reach the gate, in any phrasing/language.
+        if not _comp_admits(t, m.start(), m.end(), has_currency):
+            continue
 
         # Exclude standards/version numbers even if a cue is incidentally nearby.
         tight = _window(t, m.start(), m.end(), 6)
         if any(neg in tight for neg in _NONCOMP_NEG):
             continue
 
-        # Headcount guard: a number immediately followed by a headcount word
-        # ("800+ professionals", "team of 1500 employees") is company size, not
-        # comp. Check only the run just AFTER the number (+18 chars) so a real
-        # salary that merely shares a wider window with a headcount word elsewhere
-        # ("we are 800+ experts. Salary: €140,000") is NOT dropped.
-        post_run = t[m.end():m.end() + 18]
-        if any(re.search(r"\b" + re.escape(hw), post_run) for hw in _HEADCOUNT_WORDS):
+        # Headcount guard (POSITION-based): drop a number DIRECTLY counting a headcount
+        # noun ("800+ professionals") or following "team of ...". Retained as a cheap
+        # early-out; label-gating already refuses most headcount integers (no currency,
+        # no binding salary label), but a currency-bearing "€800 per professional" style
+        # phrasing is still caught here.
+        after = t[m.end():m.end() + _HEADCOUNT_LOOKAHEAD]
+        before = t[max(0, m.start() - 30):m.start()]
+        if _HEADCOUNT_DIRECTLY_AFTER.search(after) or _HEADCOUNT_BEFORE.search(before):
             continue
 
         # A number glued to a degree or percent sign is not money: "360° sales",
-        # "9000% growth", "20% bonus". Salary figures never carry these units.
-        # (Found in the live IT-category sample: "GROSS offers genuine 360° sales
-        # solutions" invented a €360/mo figure because the company name supplied a
-        # 'gross' cue.) Look at the char that immediately follows the matched run,
-        # skipping a single optional space.
+        # "9000% growth", "20% bonus". Salary figures never carry these units. Look at
+        # the char immediately following the matched run, skipping a single space.
         after = t[m.end():m.end() + 2].lstrip()
         if after[:1] in ("°", "%"):
             continue
@@ -620,6 +859,21 @@ def parse_comp(text: str) -> ParsedComp | None:
         mag = _to_float(num_raw)
         if mag is None or mag < 1.0:
             continue
+
+        # label_bound: this number is governed by a salary LABEL, or it is ungoverned
+        # inside a salary clause. Used in selection so a genuine disclosed salary always
+        # beats a co-present bare-currency figure (e.g. keep the 60000 salary over a
+        # 5,000,000 turnover line that named a currency). Mirrors _comp_admits rule (a).
+        cs, ce = _clause_bounds(t, m.start())
+        clause = t[cs:ce]
+        rel_s, rel_e = m.start() - cs, m.end() - cs
+        head = _governing_head(clause, rel_s, rel_e)
+        if head is not None:
+            label_bound = bool(
+                head in _SALARY_CONTEXT_GOVERNORS or _SALARY_LABEL_RX.fullmatch(head)
+            )
+        else:
+            label_bound = _SALARY_LABEL_RX.search(clause) is not None
 
         candidates.append({
             "match": m,
@@ -629,14 +883,17 @@ def parse_comp(text: str) -> ParsedComp | None:
             "mag": mag,
             "num_raw": num_raw,
             "has_currency": has_currency,
+            "label_bound": label_bound,
         })
 
     if not candidates:
         return None
 
     # ---- candidate selection (A.8) ----------------------------------------
-    # Prefer explicit-currency over cue-only; prefer an OTE/on-target figure over
-    # a base figure when equity markers are present; tie-break on highest EUR.
+    # Precedence: a salary-LABEL-bound figure beats any merely currency-anchored one
+    # (so a disclosed 60000 salary wins over a co-present 5,000,000 turnover line that
+    # named a currency); then explicit-currency over cue-only; then OTE/on-target when
+    # equity markers are present; tie-break on highest EUR.
     def _ote_proximity(c) -> int:
         return 1 if any(k in c["win"] for k in ("ote", "on-target", "on target")) else 0
 
@@ -649,11 +906,13 @@ def parse_comp(text: str) -> ParsedComp | None:
             continue
         eur = parsed.top_eur_gross_yr
         score_tuple = (
+            int(c["label_bound"]),
             int(c["has_currency"]),
             _ote_proximity(c),
             eur,
         )
         cur_best = (
+            int(best["label_bound"]) if best else -1,
             int(best["has_currency"]) if best else -1,
             _ote_proximity(best) if best else -1,
             best_eur,
@@ -682,6 +941,13 @@ def _normalize_candidate(c: dict, t: str, raw_text: str) -> ParsedComp | None:
 
     # ---- range (top-of-range), shared currency/period unless re-stated ----
     win30 = _window(t, m.start(), m.end(), 30)
+    # Clause-scoped window for PERIOD and NET/GROSS cue detection (R4 fix): a fixed
+    # ±30-char window crosses '.'/';'/newline boundaries, so a 'net margin' / 'per
+    # month budget' idiom in a NEIGHBORING clause flipped this salary's basis/period
+    # (65000 gross -> net*1.146 cleared the floor; 130000/yr -> /mo *12). Cue scanning
+    # must stay inside the number's own clause, intersected with the proximity window.
+    _cs, _ce = _clause_bounds(t, m.start())
+    cwin = t[max(_cs, m.start() - 30):min(_ce, m.end() + 30)]
     amount = c["mag"]
     rng = _RANGE.search(win30)
     raw_sub = raw_text[m.start():m.end()].strip()
@@ -708,20 +974,20 @@ def _normalize_candidate(c: dict, t: str, raw_text: str) -> ParsedComp | None:
     period_inferred = False
     unhandled_unit = False
     annual_multiplier = 1.0
-    if _has_cue(win30, _MONTHLY_CUES) or re.search(r"\bмес\b", win30):
+    if _has_cue(cwin, _MONTHLY_CUES) or re.search(r"\bмес\b", cwin):
         period, annual_multiplier = "mo", 12.0
-    elif _has_cue(win30, _YEARLY_CUES):
+    elif _has_cue(cwin, _YEARLY_CUES):
         period, annual_multiplier = "yr", 1.0
-    elif _has_cue(win30, _DAILY_CUES):
+    elif _has_cue(cwin, _DAILY_CUES):
         # Red-team #4: day rate -> annualize via WORKING_DAYS_PER_YEAR.
         period, annual_multiplier = "yr", float(WORKING_DAYS_PER_YEAR)
-    elif _has_cue(win30, _WEEKLY_CUES):
+    elif _has_cue(cwin, _WEEKLY_CUES):
         # Weekly rate -> annualize across the working year. Marked rate_unhandled so
         # the gate keeps it soft near the floor (working-weeks vary), but the figure
         # is now correctly scaled instead of treated as a raw annual total.
         period, annual_multiplier = "yr", float(WORKING_WEEKS_PER_YEAR)
         unhandled_unit = True
-    elif _has_cue(win30, _HOURLY_CUES):
+    elif _has_cue(cwin, _HOURLY_CUES):
         # Hourly rate -> annualize via working hours/year (WORKING_DAYS * hours/day).
         period, annual_multiplier = "yr", float(WORKING_DAYS_PER_YEAR) * float(WORKING_HOURS_PER_DAY)
         unhandled_unit = True
@@ -739,10 +1005,10 @@ def _normalize_candidate(c: dict, t: str, raw_text: str) -> ParsedComp | None:
     # FIX #4: basis unstated -> ASSUME gross (do not inflate). The assumption is
     # recorded via the basis_inferred audit flag below; the field itself carries
     # the assumed "gross" per the parser contract.
-    if _has_cue(win30, _NET_CUES):
+    if _has_cue(cwin, _NET_CUES):
         basis = "net"
         basis_inferred = False
-    elif _has_cue(win30, _GROSS_CUES):
+    elif _has_cue(cwin, _GROSS_CUES):
         basis = "gross"
         basis_inferred = False
     else:
@@ -788,8 +1054,31 @@ def _normalize_candidate(c: dict, t: str, raw_text: str) -> ParsedComp | None:
 
 
 def passes_comp_gate(parsed: ParsedComp | None) -> GateResult:
-    """GATE 3 verdict. FIX #3: parsed is None -> soft (manual_review), unless
-    DISCLOSED_COMP_REQUIRED is True (then hard_fail). Bands on top_eur_gross_yr."""
+    """GATE 3 verdict — ADVISORY (2026-06-30 redesign).
+
+    Free-text comp extraction cannot reliably separate a real salary from a phantom
+    (budget / revenue / deal-size / turnover / margin numbers carry the same currency
+    and period tokens as pay). Five adversarial audit rounds proved that no parser-side
+    rule converges: every phrasing fixed surfaced another. So Gate 3 no longer lets a
+    PARSED FIGURE drive the verdict at all — it is advisory:
+
+        * parsed is None        -> soft (manual_review); hard_fail only if the explicit
+                                   DISCLOSED_COMP_REQUIRED opt-in is set (disclosure-
+                                   presence gate, orthogonal to the figure's magnitude).
+        * parsed is a figure    -> ALWAYS soft. NEVER hard_fail (so a phantom can't
+                                   false-REJECT a real role) and NEVER 'pass' (so a
+                                   phantom can't false-KEEP an undisclosed one). The
+                                   EUR72k/goal bands survive ONLY as comp_headroom, a
+                                   pure RANK signal that sorts survivors within the
+                                   manual_review bucket — not as a verdict gate.
+
+    Consequence (intended, user-approved): a verdict of 'keep' is no longer reached via
+    comp; an in-lane, in-geo role with any comp reading lands in manual_review and a
+    human confirms the pay. This trades the auto-keep/auto-reject the parser could never
+    do safely for a guarantee that NO comp number — genuine or phantom — ever corrupts a
+    verdict. Salary is disclosed <5% of the time and untrustworthy when parsed, so this
+    is the safe design. See .local/filter-spec.md (comp-advisory note).
+    """
     if parsed is None:
         if DISCLOSED_COMP_REQUIRED:
             return GateResult(
@@ -807,66 +1096,24 @@ def passes_comp_gate(parsed: ParsedComp | None) -> GateResult:
         f"(period={parsed.period}, basis={parsed.basis})"
     )
 
-    # Genuine parse UNCERTAINTY = the period was guessed, or a sub-annual rate was
-    # approximately annualized. NOT included: basis_inferred (assumed gross) and
-    # currency_inferred (assumed EUR) — those are confident defaults per the parser
-    # contract, and conflating them previously leaked cleanly-disclosed below-floor
-    # figures from hard_fail to soft (audit critical #2). The near-floor soft escape
-    # exists for true FX/period uncertainty, not for a missing "gross"/"EUR" word.
-    inferred = parsed.period_inferred or parsed.rate_unhandled
-    equity_present = parsed.equity_present
-
-    # comp_headroom (the rank signal): clamp((T-72000)/65500, 0, 1); 0.0 for soft.
+    # comp_headroom — the RANK signal only. clamp((T-72000)/65500, 0, 1): a below-floor
+    # figure scores 0 (ranks like undisclosed), an at-goal figure scores 1. This is the
+    # ONLY thing the EUR72k floor now drives — sorting, never the verdict.
     denom = float(SALARY_GOAL_EUR - SALARY_AUTO_REJECT_BELOW_EUR) or 1.0
-    headroom = (T - SALARY_AUTO_REJECT_BELOW_EUR) / denom
-    headroom = max(0.0, min(1.0, headroom))
+    headroom = max(0.0, min(1.0, (T - SALARY_AUTO_REJECT_BELOW_EUR) / denom))
 
-    # Red-team #5: equity/OTE present -> disclosed cash is a lower bound; never
-    # hard_fail on it. Surface as soft for manual review.
-    if equity_present and T <= SALARY_AUTO_REJECT_BELOW_EUR:
-        return GateResult(
-            status="soft", signal=0.0,
-            reasons=[audit, "ceiling: partial comp disclosed (base only; equity/OTE present)"],
-        )
-
-    floor = float(SALARY_AUTO_REJECT_BELOW_EUR)
-    tol = floor * SALARY_FLOOR_FX_TOLERANCE
-    # Red-team #6/#3/#12: a figure within +/-tolerance of the floor, OR whose
-    # currency/period/basis was inferred, is too close to call -> soft, not hard.
-    near_floor = (floor - tol) <= T <= (floor + tol)
-
+    # Advisory band label (manual_review context for the human; not a verdict).
     if T <= SALARY_AUTO_REJECT_BELOW_EUR:
-        # Pinned contract: T <= 72000 -> hard_fail. The soft escape is reserved
-        # for genuine FX/parse UNCERTAINTY (inferred currency/period/basis); a
-        # CLEANLY disclosed figure at/under the floor always hard-fails, even when
-        # it lands within the near-floor FX tolerance band.
-        if inferred and near_floor:
-            return GateResult(
-                status="soft", signal=0.0,
-                reasons=[audit, f"ceiling: EUR{round(T)} near/under floor with FX/parse "
-                                f"uncertainty - manual review"],
-            )
-        return GateResult(
-            status="hard_fail", signal=0.0,
-            reasons=[audit, f"ceiling: disclosed top EUR{round(T)} <= 72k "
-                            f"auto-reject floor"],
-        )
+        band = (f"ceiling (advisory): EUR{round(T)} <= 72k floor — likely below target; "
+                f"verify with recruiter (manual review)")
+    elif T < SALARY_FLOOR_EUR:
+        band = f"ceiling (advisory): EUR{round(T)} - below floor (nets < EUR10k/mo)"
+    elif T < SALARY_GOAL_EUR:
+        band = f"ceiling (advisory): EUR{round(T)} - capable but short of 137.5k goal"
+    else:
+        band = f"ceiling (advisory): EUR{round(T)} - meets 137.5k goal"
 
-    if T < SALARY_FLOOR_EUR:
-        return GateResult(
-            status="pass", signal=headroom,
-            reasons=[audit, f"ceiling: EUR{round(T)} - below floor (nets < EUR10k/mo)"],
-        )
-    if T < SALARY_GOAL_EUR:
-        return GateResult(
-            status="pass", signal=headroom,
-            reasons=[audit, f"ceiling: EUR{round(T)} - capable but short of "
-                            f"137.5k goal"],
-        )
-    return GateResult(
-        status="pass", signal=headroom,
-        reasons=[audit, f"ceiling: EUR{round(T)} - meets 137.5k goal"],
-    )
+    return GateResult(status="soft", signal=headroom, reasons=[audit, band])
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1010,20 +1257,21 @@ def evaluate(job: dict) -> Verdict:
 
 def _has_explicit_hard_fail(g1: GateResult, g2: GateResult, g3: GateResult) -> bool:
     """An EXPLICIT hard_fail is one driven by a DISCLOSED, confident signal (operator
-    title, a location deny phrase, or a cleanly-disclosed below-floor salary) rather
-    than an inferred parse/FX artifact. Explicit -> final reject; a lone inferred
-    hard_fail with lane+geo passing caps at manual_review (Red-team #13)."""
+    title or a location deny phrase) rather than an inferred artifact. Explicit -> final
+    reject (Red-team #13).
+
+    NOTE (comp-advisory redesign): Gate 3 no longer hard_fails on any PARSED FIGURE — a
+    comp number can never drive a reject. Gate 3 hard_fails only when comp is UNDISCLOSED
+    and the explicit DISCLOSED_COMP_REQUIRED opt-in is set; that is a confident
+    disclosure-presence decision the operator asked for, so it counts as explicit."""
     if g1.status == "hard_fail" and any("operator" in r for r in g1.reasons):
         return True
     if g2.status == "hard_fail":
         # Gate 2 hard_fail is always a matched LOCATION_DENY phrase (explicit).
         return True
     if g3.status == "hard_fail" and any(
-        "auto-reject floor" in r or "disclosed top" in r for r in g3.reasons
+        "DISCLOSED_COMP_REQUIRED" in r for r in g3.reasons
     ):
-        # Gate 3 only hard_fails at all for a parsed figure; passes_comp_gate routes
-        # genuinely uncertain figures (inferred currency/period/basis, near-floor FX,
-        # equity-present) to SOFT instead. So a comp HARD_FAIL carrying the
-        # "disclosed top <= 72k auto-reject floor" reason is a confident disclosure.
+        # The only remaining Gate-3 hard_fail: comp undisclosed + opt-in flag set.
         return True
     return False
