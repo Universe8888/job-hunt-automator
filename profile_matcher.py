@@ -22,14 +22,14 @@ logger = logging.getLogger(__name__)
 
 
 def extract_pdf_text(filepath: str) -> str:
-    """Extract all text from a PDF file using PyPDF2, falling back to pypdf."""
+    """Extract all text from a PDF file using pypdf, with a PyPDF2 fallback."""
     try:
         try:
-            from PyPDF2 import PdfReader as PyPDF2Reader
-            reader_cls: Any = PyPDF2Reader
-        except ImportError:
             from pypdf import PdfReader as PypdfReader
-            reader_cls = PypdfReader
+            reader_cls: Any = PypdfReader
+        except ImportError:
+            from PyPDF2 import PdfReader as PyPDF2Reader
+            reader_cls = PyPDF2Reader
         reader = reader_cls(filepath)
         text_parts = []
         for page in reader.pages:
@@ -40,7 +40,7 @@ def extract_pdf_text(filepath: str) -> str:
         logger.info("📄 Extracted %d characters from %s (%d pages)", len(full_text), filepath, len(reader.pages))
         return full_text
     except ImportError:
-        logger.warning("⚠️  PyPDF2 not installed. Skipping PDF extraction.")
+        logger.warning("⚠️  No PDF reader package installed. Skipping PDF extraction.")
         return ""
     except Exception as e:
         logger.error("❌ Failed to read PDF %s: %s", filepath, str(e))

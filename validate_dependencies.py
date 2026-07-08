@@ -14,7 +14,7 @@ REQUIRED_PACKAGES = [
     ("playwright_stealth", ">=1.0.6"),
     ("beautifulsoup4", ">=4.12.0"),
     ("lxml", ">=5.0.0"),
-    ("PyPDF2", ">=3.0.0"),
+    ("pypdf", ">=3.9.0"),
     ("python-dotenv", ">=1.0.0"),
     ("tqdm", ">=4.66.0"),
 ]
