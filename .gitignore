@@ -111,6 +111,7 @@ coverage.xml
 # Local career-strategy context
 # ──────────────────────────────────────────────
 .local/
+.playwright-mcp/
 CLAUDE.local.md
 AGENTS.md
 # Brainstorming/spec docs reference the private .local strategy — keep out of the
